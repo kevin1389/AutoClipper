@@ -1,0 +1,43 @@
+{
+  "name": "autoclipper",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AutoClipper — AI video clipping platform (upload -> transcribe -> select highlights -> render 9:16 clips)",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "prepare:browser": "node scripts/copy-browser-assets.mjs",
+    "predev": "npm run prepare:browser",
+    "dev": "next dev --hostname 0.0.0.0 --port 3000",
+    "prebuild": "npm run prepare:browser",
+    "build": "next build",
+    "start": "next start --hostname 0.0.0.0 --port 3000",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "storage:smoke": "tsx scripts/storage-smoke.ts"
+  },
+  "dependencies": {
+    "@ffmpeg/core": "^0.12.10",
+    "@huggingface/transformers": "^3.8.1",
+    "archiver": "^8.0.0",
+    "ffmpeg-static": "^5.3.0",
+    "ffprobe-static": "^3.1.0",
+    "next": "^16.4.5",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@opennextjs/cloudflare": "1.20.12",
+    "@tailwindcss/postcss": "^4.3.4",
+    "@types/archiver": "^8.0.0",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "tailwindcss": "^4.3.4",
+    "typescript": "^7.0.2",
+    "wrangler": "4.148.0"
+  }
+}

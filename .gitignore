@@ -1,0 +1,38 @@
+node_modules/
+.next/
+out/
+build/
+next-env.d.ts
+*.tsbuildinfo
+
+# Runtime data: uploads, working files, rendered clips, sqlite database
+data/
+
+# Secrets: never commit real credentials. The template below is intentional.
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+*.pem
+*.key
+*.p12
+.npmrc
+
+.DS_Store
+*.log
+.smoke/
+artifacts/
+
+# Generated browser assets (npm run prepare:browser copies them before dev/build)
+public/ffmpeg/
+public/transformers/
+public/fonts/
+public/browser-assets.json
+
+# Legacy local Faster-Whisper state (not used by the browser pipeline)
+.venv-whisper/
+.whisper-models/
+/freebuff-sites-build/
+/.open-next/
+/.wrangler/

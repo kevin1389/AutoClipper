@@ -1,0 +1,126 @@
+@import 'tailwindcss';
+
+@theme {
+  --color-ink-950: #050506;
+  --color-ink-900: #09090b;
+  --color-ink-850: #0c0c0f;
+  --color-ink-800: #111114;
+  --color-ink-750: #16161a;
+  --color-ink-700: #1e1e24;
+  --color-ink-600: #2a2a32;
+  --color-ink-500: #3b3b46;
+
+  --color-mist-500: #6f6f7b;
+  --color-mist-400: #8d8d99;
+  --color-mist-300: #b4b4bf;
+  --color-mist-200: #d6d6dd;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial,
+    'Apple Color Emoji', 'Segoe UI Emoji';
+
+  --animate-pulse-soft: pulse-soft 2.4s ease-in-out infinite;
+  --animate-spin-slow: spin 1.6s linear infinite;
+}
+
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@layer base {
+  html {
+    color-scheme: dark;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--color-ink-950);
+    color: #ffffff;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background-color: rgba(255, 255, 255, 0.18);
+  }
+
+  input::placeholder,
+  textarea::placeholder {
+    color: var(--color-mist-500);
+  }
+
+  *:focus-visible {
+    outline: 2px solid rgba(255, 255, 255, 0.6);
+    outline-offset: 2px;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply rounded-2xl border border-ink-700 bg-ink-900;
+  }
+
+  .panel-soft {
+    @apply rounded-2xl border border-ink-700/70 bg-ink-850;
+  }
+
+  .btn {
+    @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+
+  /*
+   * Tailwind v4 does not let one component class @apply another, so each button
+   * variant repeats the shared base utilities instead of composing `.btn`.
+   */
+  .btn-primary {
+    @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 bg-white text-black hover:bg-mist-200;
+  }
+
+  .btn-secondary {
+    @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 border border-ink-600 bg-ink-800 text-white hover:border-ink-500 hover:bg-ink-750;
+  }
+
+  .btn-ghost {
+    @apply inline-flex cursor-pointer items-center justify-center gap-2 rounded-xl px-4 py-2.5 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-50 text-mist-300 hover:bg-ink-800 hover:text-white;
+  }
+
+  .input {
+    @apply w-full rounded-xl border border-ink-600 bg-ink-950 px-3.5 py-2.5 text-sm text-white transition-colors outline-none placeholder:text-mist-500 focus:border-mist-500;
+  }
+
+  .label {
+    @apply text-[11px] font-semibold uppercase tracking-[0.14em] text-mist-400;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-ink-600 bg-ink-850 px-2.5 py-1 text-[11px] font-medium text-mist-300;
+  }
+
+  .link {
+    @apply text-mist-200 underline decoration-ink-500 underline-offset-4 transition-colors hover:text-white hover:decoration-mist-400;
+  }
+
+  .field-hint {
+    @apply text-xs leading-relaxed text-mist-500;
+  }
+}
+
+@utility text-balance-tight {
+  text-wrap: balance;
+}
