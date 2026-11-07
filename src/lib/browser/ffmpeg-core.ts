@@ -6,6 +6,11 @@
  * that expression at build time, so this worker talks to the official
  * @ffmpeg/core module directly. No CDN, server process or native binary is
  * involved.
+ *
+ * A wasm trap is not an ordinary FFmpeg command failure. Once the core traps,
+ * its function table and heap can no longer be trusted. The wrapper marks the
+ * instance unhealthy so the processor can dispose it, mount the source on a
+ * fresh core and retry instead of reusing corrupted state.
  */
 
 export interface FfmpegCore {
@@ -26,6 +31,7 @@ export interface FfmpegCore {
   ffprobe(...args: string[]): number;
   reset(): void;
   ret: number;
+  HEAPU8?: Uint8Array;
 }
 
 interface CoreFactory {
@@ -39,12 +45,51 @@ const loadModule = new Function('url', 'return import(url)') as (
   url: string,
 ) => Promise<{ default: CoreFactory }>;
 
+/** The wasm core trapped or aborted; the instance must not be reused. */
+export class FfmpegCoreError extends Error {
+  readonly code = 'ffmpeg_wasm_core_crashed';
+  readonly generation: number;
+  readonly execCount: number;
+  readonly operation: 'exec' | 'ffprobe';
+  readonly memoryBytes: number;
+
+  constructor(
+    message: string,
+    options: {
+      cause: unknown;
+      generation: number;
+      execCount: number;
+      operation: 'exec' | 'ffprobe';
+      memoryBytes: number;
+    },
+  ) {
+    super(message, { cause: options.cause });
+    this.name = 'FfmpegCoreError';
+    this.generation = options.generation;
+    this.execCount = options.execCount;
+    this.operation = options.operation;
+    this.memoryBytes = options.memoryBytes;
+  }
+}
+
+export function isFfmpegCoreError(error: unknown): error is FfmpegCoreError {
+  return (
+    error instanceof FfmpegCoreError ||
+    (error instanceof Error &&
+      (error.name === 'FfmpegCoreError' ||
+        (error as { code?: unknown }).code === 'ffmpeg_wasm_core_crashed'))
+  );
+}
+
 export class BrowserFfmpeg {
   loaded = false;
+  private static nextGeneration = 1;
+  readonly generation = BrowserFfmpeg.nextGeneration++;
   private core: FfmpegCore | null = null;
   private logHandlers: LogHandler[] = [];
   private progressHandlers: ProgressHandler[] = [];
   private sourceMounted = false;
+  private execCount = 0;
 
   on(event: 'log', handler: LogHandler): void {
     if (event === 'log') this.logHandlers.push(handler);
@@ -133,17 +178,65 @@ export class BrowserFfmpeg {
     this.requireCore().FS.unlink(path);
   }
 
+  get memoryBytes(): number {
+    return this.core?.HEAPU8?.byteLength ?? 0;
+  }
+
+  private crashMessage(operation: 'exec' | 'ffprobe', error: unknown): FfmpegCoreError {
+    this.loaded = false;
+    const cause = error instanceof Error ? error : new Error(String(error));
+    return new FfmpegCoreError(
+      `FFmpeg.wasm core trapped during ${operation} (generation ${this.generation}, exec ${this.execCount}): ${cause.message}`,
+      {
+        cause,
+        generation: this.generation,
+        execCount: this.execCount,
+        operation,
+        memoryBytes: this.memoryBytes,
+      },
+    );
+  }
+
   async exec(args: string[]): Promise<number> {
     const core = this.requireCore();
+    this.execCount += 1;
     core.reset();
-    core.exec(...args);
-    return core.ret;
+    try {
+      const result = core.exec(...args);
+      if (result === undefined) {
+        throw new Error('FFmpeg.wasm returned no exit status.');
+      }
+      return core.ret;
+    } catch (error) {
+      throw this.crashMessage('exec', error);
+    }
   }
 
   async ffprobe(args: string[]): Promise<number> {
     const core = this.requireCore();
+    this.execCount += 1;
     core.reset();
-    const result = core.ffprobe(...args);
-    return Number.isFinite(result) ? result : core.ret;
+    try {
+      const result = core.ffprobe(...args);
+      const status = Number.isFinite(result) ? result : core.ret;
+      if (!Number.isFinite(status)) {
+        throw new Error('FFprobe returned no exit status.');
+      }
+      return status;
+    } catch (error) {
+      throw this.crashMessage('ffprobe', error);
+    }
+  }
+
+  /** Drops the corrupt wasm instance; Chrome can reclaim its heap. */
+  dispose(): void {
+    try {
+      if (this.sourceMounted) this.core?.FS.unmount('/source');
+    } catch {
+      // The core may already be unusable; disposal is still required.
+    }
+    this.sourceMounted = false;
+    this.core = null;
+    this.loaded = false;
   }
 }

@@ -163,7 +163,7 @@ export function config(): AppConfig {
     // data unless the user explicitly asks to keep a source copy.
     maxUploadBytes: intEnv('AC_MAX_UPLOAD_MB', 1024) * 1024 * 1024,
     ffmpegPath: resolveBinary(process.env.FFMPEG_PATH, 'ffmpeg-static', 'ffmpeg'),
-    ffprobePath: resolveBinary(process.env.FFPROBE_PATH, 'ffprobe-static', 'ffprobe'),
+    ffprobePath: resolveBinary(process.env.FFPROBE_PATH, '@ffprobe-installer/ffprobe', 'ffprobe'),
     fontsDir: FONTS_DIR,
     transcription: {
       apiKey: process.env.TRANSCRIPTION_API_KEY?.trim() || null,

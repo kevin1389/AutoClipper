@@ -91,6 +91,7 @@ export class BrowserTranscriber {
 
   async load(hooks: TranscriptionHooks, forceWasm = false): Promise<void> {
     if (this.transcriber) return;
+    const startedAt = performance.now();
     configureModelLoader();
 
     const webgpu = !forceWasm && (await canUseWebGpu());
@@ -126,6 +127,9 @@ export class BrowserTranscriber {
         const result = await pipeline('automatic-speech-recognition', MODEL_ID, options as never);
         this.transcriber = result as unknown as AsrPipeline;
         this.engine = engine;
+        console.info(
+          `[ac-timing] whisper-model-${engine} ${Math.round(performance.now() - startedAt)}ms`,
+        );
         hooks.onModelProgress('Whisper model ready', 1);
         hooks.onEngine(
           engine,
@@ -176,11 +180,15 @@ export class BrowserTranscriber {
         `Transcribing audio ${index + 1} of ${totalChunks} with ${this.engine === 'webgpu' ? 'WebGPU' : 'WASM CPU'}`,
       );
       let output: AsrOutput | AsrOutput[];
+      const chunkStartedAt = performance.now();
       try {
         output = await this.transcriber(audio.samples.subarray(start, end), {
           return_timestamps: 'word',
           force_full_sequences: false,
         });
+        console.info(
+          `[ac-timing] whisper-chunk ${this.engine} ${index + 1}/${totalChunks} ${Math.round(performance.now() - chunkStartedAt)}ms`,
+        );
       } catch (caught) {
         const error = caught instanceof Error ? caught : new Error(String(caught));
         throw new TranscriptionError(

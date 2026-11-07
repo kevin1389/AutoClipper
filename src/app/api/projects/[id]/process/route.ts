@@ -70,12 +70,19 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     if (project.status === 'processing' && body.resume !== true && body.force !== true) {
       return jsonError(409, 'already_processing', 'This project is already processing. Resume only if the original tab was closed.');
     }
-    if ((await db.getClips(id)).length > 0) await db.resetProjectForRun(id);
+    const existingClips = await db.getClips(id);
+    const restart = body.restart === true;
+    if (restart && existingClips.length > 0) await db.resetProjectForRun(id);
+    const keptClips = restart ? [] : existingClips;
+    const rendered = keptClips.filter((clip) => clip.status === 'rendered').length;
     await db.updateProject(id, {
       status: 'processing',
-      stage: 'probe',
-      progress: 1,
-      statusDetail: 'Starting browser processor',
+      stage: keptClips.length > 0 ? 'render' : 'probe',
+      progress: 0,
+      statusDetail:
+        keptClips.length > 0
+          ? `Resuming with ${rendered} of ${keptClips.length} clips already rendered`
+          : 'Starting browser processor',
       error: null,
     });
     return Response.json({ ok: true, project: await db.getProjectForOwner(id, auth.user.id) });
@@ -91,10 +98,13 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     const stage = STAGES.includes(String(body.stage) as PipelineStage) ? (String(body.stage) as PipelineStage) : 'probe';
     const progress = Math.max(0, Math.min(100, Math.round(Number(body.progress) || 0)));
     const detail = cleanText(body.detail, 500) || null;
+    // Multiple encoder progress callbacks can be in flight. Never let an older
+    // frame overwrite a newer one from the same stage.
+    const monotonic = project.stage === stage ? Math.max(project.progress, progress) : progress;
     await db.updateProject(id, {
       status: 'processing',
       stage,
-      progress,
+      progress: monotonic,
       statusDetail: detail,
       error: null,
     });
@@ -159,8 +169,12 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
   if (action === 'complete') {
     const clips = await db.getClips(id);
     const rendered = clips.filter((clip) => clip.status === 'rendered').length;
-    if (clips.length === 0 || rendered === 0) {
-      return jsonError(409, 'no_rendered_clips', 'There are no rendered clips to complete this project.');
+    if (clips.length === 0 || rendered !== clips.length) {
+      return jsonError(
+        409,
+        'incomplete_render',
+        `Only ${rendered} of ${clips.length} selected clips have verified rendered files. The project was not marked complete.`,
+      );
     }
     await db.updateProject(id, {
       status: 'completed',

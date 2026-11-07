@@ -26,6 +26,8 @@ export interface StorageProviderUsage {
   availableBytes: number | null;
   error: string | null;
   measuredAt: string | null;
+  /** Last successful daily reconciliation for this provider, if one has run. */
+  reconciledAt: string | null;
 }
 
 export interface StorageProjectUsage {
@@ -56,6 +58,8 @@ export interface StorageUsage {
   configuredCapacityBytes: number;
   /** Sum of safety caps for providers that were actually measured. */
   verifiedCapacityBytes: number;
+  /** Configured capacity that no successful measurement backs yet. */
+  unverifiedCapacityBytes: number;
   totalUsedBytes: number;
   totalAvailableBytes: number;
   /** Bytes held by active uploads/multipart sessions. */

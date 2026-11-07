@@ -29,6 +29,17 @@ export interface BrowserProjectPayload {
   hasAudio: boolean;
 }
 
+/** The subset of a persisted clip the processor needs to resume rendering. */
+export interface ProcessorClipSummary {
+  id: string;
+  index: number;
+  title: string;
+  startMs: number;
+  endMs: number;
+  status: 'pending' | 'rendered' | 'failed';
+  edits: ClipEdits | null;
+}
+
 export interface StartMessage {
   type: 'start';
   projectId: string;
@@ -51,7 +62,22 @@ export interface RenderClipMessage {
   selected?: SelectedClip | null;
 }
 
-export type WorkerRequest = StartMessage | RenderClipMessage;
+export interface PosterRequest {
+  type: 'poster-request';
+  requestId: string;
+  clipNumber: number;
+  /** A private copy of the rendered MP4; the worker keeps its own bytes for upload. */
+  video: ArrayBuffer;
+}
+
+export interface PosterResponse {
+  type: 'poster-response';
+  requestId: string;
+  poster?: ArrayBuffer;
+  error?: string;
+}
+
+export type WorkerRequest = StartMessage | RenderClipMessage | PosterResponse;
 
 export type WorkerEvent =
   | { type: 'progress'; stage: BrowserStage; progress: number; detail: string }
@@ -63,10 +89,12 @@ export type WorkerEvent =
   | { type: 'clip'; clip: ClipView }
   | { type: 'done'; project: Project }
   | { type: 'render-done'; clip: ClipView }
+  | PosterRequest
   | { type: 'error'; message: string; code: string };
 
 export interface ProcessorData {
   project: Project;
   transcript: BrowserTranscript | null;
+  clips: ProcessorClipSummary[];
   sourceUrl: string;
 }

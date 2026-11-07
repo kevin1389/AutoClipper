@@ -1,7 +1,8 @@
 'use client';
 
 import type { ClipEdits, ClipView } from '../types';
-import type { RenderClipMessage, WorkerEvent } from './protocol';
+import type { PosterRequest, PosterResponse, RenderClipMessage, WorkerEvent } from './protocol';
+import { capturePosterFromVideo } from './poster-capture';
 
 type EventHandler = (event: WorkerEvent) => void;
 
@@ -25,6 +26,10 @@ export class BrowserProcessorClient {
     const worker = new Worker(new URL('./processor.worker.ts', import.meta.url), { type: 'module' });
     worker.onmessage = (event: MessageEvent<WorkerEvent>) => {
       const message = event.data;
+      if (message.type === 'poster-request') {
+        void this.respondWithPoster(message);
+        return;
+      }
       if (message.type === 'render-done') {
         this.renderResolve?.(message.clip);
         this.renderResolve = null;
@@ -50,6 +55,28 @@ export class BrowserProcessorClient {
     };
     this.worker = worker;
     return worker;
+  }
+
+  private async respondWithPoster(request: PosterRequest): Promise<void> {
+    const worker = this.worker;
+    if (!worker) return;
+    try {
+      const poster = await capturePosterFromVideo(request.video);
+      const buffer = poster.buffer as ArrayBuffer;
+      const response: PosterResponse = {
+        type: 'poster-response',
+        requestId: request.requestId,
+        poster: buffer,
+      };
+      worker.postMessage(response, [buffer]);
+    } catch (error) {
+      const response: PosterResponse = {
+        type: 'poster-response',
+        requestId: request.requestId,
+        error: (error as Error).message.slice(0, 500),
+      };
+      worker.postMessage(response);
+    }
   }
 
   start(projectId: string, engine: 'auto' | 'wasm' = 'auto', sourceFile: File | null = null): void {

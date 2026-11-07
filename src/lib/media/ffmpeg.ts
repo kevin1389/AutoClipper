@@ -61,6 +61,8 @@ async function run(
 
 export interface MediaProbe {
   durationMs: number;
+  /** Duration of the video track itself, which can be shorter than the container. */
+  videoDurationMs: number;
   width: number;
   height: number;
   fps: number | null;
@@ -115,9 +117,11 @@ export async function probeMedia(filePath: string): Promise<MediaProbe> {
   const fps = num && den ? Math.round((num / den) * 100) / 100 : null;
 
   const durationSeconds = Number.parseFloat(parsed.format?.duration ?? video.duration ?? '0');
+  const videoDurationSeconds = Number.parseFloat(video.duration ?? '0');
 
   return {
     durationMs: Number.isFinite(durationSeconds) ? Math.round(durationSeconds * 1000) : 0,
+    videoDurationMs: Number.isFinite(videoDurationSeconds) ? Math.round(videoDurationSeconds * 1000) : 0,
     width: swapped ? (video.height ?? 0) : (video.width ?? 0),
     height: swapped ? (video.width ?? 0) : (video.height ?? 0),
     fps,
@@ -300,7 +304,7 @@ export async function renderVerticalClip(
   );
 
   if (input.hasAudio) {
-    args.push('-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2');
+    args.push('-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2');
   } else {
     args.push('-an');
   }
@@ -405,12 +409,13 @@ export async function renderEditedClip(
     }`,
   );
 
-  let chain = `[vcat]${crop.filter}`;
+  // Resample before zoompan. zoompan emits one frame per input frame at its
+  // output timebase; feeding it 23.976 fps directly would shorten the video
+  // track by 20% relative to the audio.
+  let chain = `[vcat]${crop.filter},fps=30`;
   if (input.plan.zooms.length > 0) {
     const zoomExpression = buildZoomExpression(input.plan.zooms);
     chain += `,zoompan=z='${zoomExpression}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30`;
-  } else {
-    chain += ',fps=30';
   }
   if (assFileName) {
     const fontsRelative = path.relative(input.workDir, config().fontsDir).split(path.sep).join('/');
@@ -447,7 +452,7 @@ export async function renderEditedClip(
     '+faststart',
   );
   if (input.hasAudio) {
-    args.push('-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', '2');
+    args.push('-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-ac', '2');
   } else {
     args.push('-an');
   }

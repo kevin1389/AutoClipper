@@ -17,6 +17,7 @@ import type {
   StorageReservationRecord,
   StorageReservationStatus,
   StorageReservationSummary,
+  StorageReconciliationRecord,
 } from './db-sqlite';
 import type { ProjectJob } from './types';
 
@@ -51,6 +52,7 @@ export type {
   StorageReservationRecord,
   StorageReservationStatus,
   StorageReservationSummary,
+  StorageReconciliationRecord,
 } from './db-sqlite';
 
 interface D1Database {
@@ -214,6 +216,21 @@ export const setStorageProviderState: SqliteFunction<'setStorageProviderState'> 
   call('setStorageProviderState', args);
 export const getStorageProviderState: SqliteFunction<'getStorageProviderState'> = (...args) =>
   call('getStorageProviderState', args);
+export const compareAndSetStorageProviderState: SqliteFunction<'compareAndSetStorageProviderState'> = (
+  ...args
+) => call('compareAndSetStorageProviderState', args);
+export const claimStorageReconciliation: SqliteFunction<'claimStorageReconciliation'> = (...args) =>
+  call('claimStorageReconciliation', args);
+export const finishStorageReconciliation: SqliteFunction<'finishStorageReconciliation'> = (...args) =>
+  call('finishStorageReconciliation', args);
+export const getStorageReconciliation: SqliteFunction<'getStorageReconciliation'> = (...args) =>
+  call('getStorageReconciliation', args);
+export const consumeRateLimitRow: SqliteFunction<'consumeRateLimitRow'> = (...args) =>
+  call('consumeRateLimitRow', args);
+export const resetRateLimitRow: SqliteFunction<'resetRateLimitRow'> = (...args) =>
+  call('resetRateLimitRow', args);
+export const purgeRateLimitRows: SqliteFunction<'purgeRateLimitRows'> = (...args) =>
+  call('purgeRateLimitRows', args);
 
 export const enqueueJob: SqliteFunction<'enqueueJob'> = (...args) => call('enqueueJob', args);
 export const getLatestJob: SqliteFunction<'getLatestJob'> = (...args) =>

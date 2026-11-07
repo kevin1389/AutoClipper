@@ -5,6 +5,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { normalizeEmail } from './email';
 import { config } from './env';
 import { RESERVE_STORAGE_CAPACITY_SQL } from './storage-capacity-sql';
+import {
+  CLAIM_STORAGE_RECONCILIATION_SQL,
+  FINISH_STORAGE_RECONCILIATION_SQL,
+} from './storage-reconcile-sql';
+import { CONSUME_RATE_LIMIT_SQL } from './rate-limit-sql';
 import { StorageUnavailableError } from './storage-error';
 import type {
   Clip,
@@ -47,6 +52,14 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions (user_id);
 CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions (expires_at);
+
+CREATE TABLE IF NOT EXISTS rate_limits (
+  key TEXT PRIMARY KEY,
+  count INTEGER NOT NULL DEFAULT 0,
+  window_started_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS rate_limits_window_idx ON rate_limits (window_started_at);
 
 CREATE TABLE IF NOT EXISTS auth_tokens (
   token_hash TEXT PRIMARY KEY,
@@ -202,6 +215,18 @@ CREATE TABLE IF NOT EXISTS storage_provider_state (
   verified INTEGER NOT NULL DEFAULT 0,
   measured_at TEXT,
   last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS storage_reconciliation (
+  provider_id TEXT PRIMARY KEY,
+  last_started_at TEXT NOT NULL,
+  last_finished_at TEXT,
+  last_success_at TEXT,
+  next_attempt_at TEXT,
+  lease_until TEXT,
+  last_error TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL
 );
 `;
@@ -812,6 +837,18 @@ export interface StorageProviderStateRecord {
   measuredAt: string | null;
   lastError: string | null;
   updatedAt: string;
+}
+
+/** Durable bookkeeping for the once-per-day provider reconciliation. */
+export interface StorageReconciliationRecord {
+  providerId: string;
+  lastStartedAt: string;
+  lastFinishedAt: string | null;
+  lastSuccessAt: string | null;
+  nextAttemptAt: string | null;
+  leaseUntil: string | null;
+  lastError: string | null;
+  consecutiveFailures: number;
 }
 
 export interface StorageBytesByProject {
@@ -1557,6 +1594,154 @@ export function getStorageProviderState(providerId: string): StorageProviderStat
     measuredAt: (row.measured_at as string | null) ?? null,
     lastError: (row.last_error as string | null) ?? null,
     updatedAt: String(row.updated_at),
+  };
+}
+
+/** Atomic fixed-window consume; returns the count this caller produced. */
+export function consumeRateLimitRow(input: {
+  key: string;
+  now: string;
+  resetBefore: string;
+}): { count: number; windowStartedAt: string } | null {
+  const row = getDb()
+    .prepare(CONSUME_RATE_LIMIT_SQL)
+    .get(
+      input.key,
+      input.now,
+      input.now,
+      input.resetBefore,
+      input.resetBefore,
+    ) as Row | undefined;
+  if (!row) return null;
+  return {
+    count: Number(row.count ?? 0),
+    windowStartedAt: String(row.window_started_at),
+  };
+}
+
+export function resetRateLimitRow(key: string): void {
+  getDb().prepare('DELETE FROM rate_limits WHERE key = ?').run(key);
+}
+
+export function purgeRateLimitRows(before: string): number {
+  const result = getDb().prepare('DELETE FROM rate_limits WHERE window_started_at < ?').run(before);
+  return Number(result.changes ?? 0);
+}
+
+/**
+ * Writes provider state only if nobody else changed it since `expectedUpdatedAt`
+ * was read. A daily listing can take seconds, and applying it on top of a newer
+ * measurement would resurrect stale usage numbers.
+ */
+export function compareAndSetStorageProviderState(input: {
+  providerId: string;
+  listedBytes: number;
+  externalBytes: number;
+  verified: boolean;
+  measuredAt: string | null;
+  lastError: string | null;
+  expectedUpdatedAt: string | null;
+}): boolean {
+  const database = getDb();
+  const timestamp = now();
+  const listedBytes = Math.max(0, Math.round(input.listedBytes));
+  const externalBytes = Math.max(0, Math.round(input.externalBytes));
+  if (input.expectedUpdatedAt === null) {
+    const result = database
+      .prepare(
+        `INSERT INTO storage_provider_state
+           (provider_id, listed_bytes, external_bytes, verified, measured_at, last_error, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(provider_id) DO NOTHING`,
+      )
+      .run(
+        input.providerId,
+        listedBytes,
+        externalBytes,
+        input.verified ? 1 : 0,
+        input.measuredAt,
+        input.lastError,
+        timestamp,
+      );
+    return Number(result.changes ?? 0) > 0;
+  }
+  const result = database
+    .prepare(
+      `UPDATE storage_provider_state
+       SET listed_bytes = ?, external_bytes = ?, verified = ?, measured_at = ?, last_error = ?, updated_at = ?
+       WHERE provider_id = ? AND updated_at = ?`,
+    )
+    .run(
+      listedBytes,
+      externalBytes,
+      input.verified ? 1 : 0,
+      input.measuredAt,
+      input.lastError,
+      timestamp,
+      input.providerId,
+      input.expectedUpdatedAt,
+    );
+  return Number(result.changes ?? 0) > 0;
+}
+
+export function claimStorageReconciliation(input: {
+  providerId: string;
+  now: string;
+  leaseUntil: string;
+  force: boolean;
+}): boolean {
+  const result = getDb()
+    .prepare(CLAIM_STORAGE_RECONCILIATION_SQL)
+    .run(
+      input.providerId,
+      input.now,
+      input.leaseUntil,
+      input.now,
+      input.force ? 1 : 0,
+      input.now,
+      input.now,
+    );
+  return Number(result.changes ?? 0) > 0;
+}
+
+export function finishStorageReconciliation(input: {
+  providerId: string;
+  finishedAt: string;
+  success: boolean;
+  nextAttemptAt: string;
+  error: string | null;
+}): void {
+  getDb()
+    .prepare(FINISH_STORAGE_RECONCILIATION_SQL)
+    .run(
+      input.finishedAt,
+      input.success ? 1 : 0,
+      input.finishedAt,
+      input.nextAttemptAt,
+      input.error,
+      input.success ? 1 : 0,
+      input.success ? 0 : 1,
+      input.finishedAt,
+      input.providerId,
+    );
+}
+
+export function getStorageReconciliation(
+  providerId: string,
+): StorageReconciliationRecord | null {
+  const row = getDb()
+    .prepare('SELECT * FROM storage_reconciliation WHERE provider_id = ?')
+    .get(providerId) as Row | undefined;
+  if (!row) return null;
+  return {
+    providerId: String(row.provider_id),
+    lastStartedAt: String(row.last_started_at),
+    lastFinishedAt: (row.last_finished_at as string | null) ?? null,
+    lastSuccessAt: (row.last_success_at as string | null) ?? null,
+    nextAttemptAt: (row.next_attempt_at as string | null) ?? null,
+    leaseUntil: (row.lease_until as string | null) ?? null,
+    lastError: (row.last_error as string | null) ?? null,
+    consecutiveFailures: Number(row.consecutive_failures ?? 0),
   };
 }
 

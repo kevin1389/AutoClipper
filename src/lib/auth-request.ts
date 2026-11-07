@@ -45,8 +45,19 @@ export async function readJsonObject(request: Request): Promise<Record<string, u
   return parsed as Record<string, unknown>;
 }
 
-/** Best-effort caller address for rate limiting (proxy headers, then local). */
+/**
+ * Best-effort caller address for rate limiting.
+ *
+ * These headers are only trustworthy when a proxy sets them: on a directly
+ * exposed Node server a client can invent `x-forwarded-for`. Client-scoped
+ * limits are therefore a secondary guard, and sign-in additionally throttles
+ * an unspoofable account bucket. `cf-connecting-ip` is set by Cloudflare and
+ * is preferred because Cloudflare overwrites any client-supplied value.
+ */
 export function clientKey(request: Request): string {
-  const forwarded = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim();
-  return forwarded || request.headers.get('x-real-ip')?.trim() || 'local';
+  const forwarded =
+    request.headers.get('cf-connecting-ip')?.trim() ||
+    request.headers.get('x-real-ip')?.trim() ||
+    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim();
+  return forwarded || 'local';
 }

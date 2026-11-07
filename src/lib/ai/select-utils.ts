@@ -11,7 +11,7 @@ export interface Sentence {
 
 export const MIN_CLIP_MS = 7_000;
 export const MAX_CLIP_MS = 60_000;
-export const MIN_CLIP_GAP_MS = 1_200;
+export const MIN_CLIP_GAP_MS = 3_000;
 
 const TERMINAL_RE = /[.!?]["')\]]?$/;
 
@@ -139,5 +139,7 @@ export function finalizeSelection(
     if (accepted.length >= limit) break;
   }
 
-  return accepted.sort((a, b) => a.startMs - b.startMs);
+  // Preserve score order. The persisted clip index is therefore the estimated
+  // potential rank: strongest hook/engagement/clarity/payoff first.
+  return accepted;
 }

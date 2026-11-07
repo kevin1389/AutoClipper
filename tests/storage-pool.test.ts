@@ -444,6 +444,24 @@ test('remote ranges, downloads and ZIP exports stream provider objects', async (
   assert.deepEqual(unzipFilebase.stdout, Buffer.from(filebaseData));
 });
 
+test('a provider read outage is storage_unavailable, never a false file_not_found', async () => {
+  resetAll();
+  const project = newProject('provider-read-error');
+  const record = await putAsset(project.id, project.key, 64, 'provider-read-error');
+  const remotePath = storageObjectPath(record);
+
+  mock.failBucketChecks.add('test-b2');
+  const response = await fileResponse(new Request('http://localhost/clip'), remotePath, {
+    contentType: 'video/mp4',
+  });
+  assert.equal(response.status, 503);
+  const body = (await response.json()) as { code?: string; error?: string };
+  assert.equal(body.code, 'storage_unavailable');
+  assert.match(body.error ?? '', /not a missing file/i);
+  mock.failBucketChecks.clear();
+  resetStorageMeasurementCache();
+});
+
 test('project deletion crosses every provider and preserves the record after a failed delete', async () => {
   resetAll();
   const project = newProject('deletion');

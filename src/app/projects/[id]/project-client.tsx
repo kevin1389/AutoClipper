@@ -174,7 +174,7 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
     return () => clearInterval(timer);
   }, [active, applyView, project.id]);
 
-  const startProcessing = async (force: boolean) => {
+  const startProcessing = async (force: boolean, restart = false) => {
     if (view.sourceMode === 'local' && !localFile) {
       setActionError('Attach the original video on this device before processing. The source never left your browser.');
       return;
@@ -188,7 +188,7 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
       const response = await fetch(`/api/projects/${project.id}/process`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ action: 'start', force, resume: force }),
+        body: JSON.stringify({ action: 'start', force, resume: force, restart }),
       });
       if (!response.ok) {
         const data = (await response.json().catch(() => ({}))) as { error?: string };
@@ -198,7 +198,7 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
       setView((previous) => ({
         ...previous,
         project: data.project,
-        clips: force ? [] : previous.clips,
+        clips: restart ? [] : previous.clips,
       }));
       setProcessingHere(true);
       setBusy(false);
@@ -347,7 +347,7 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
               <button
                 type="button"
                 className="btn-secondary text-xs"
-                onClick={() => void startProcessing(true)}
+                onClick={() => void startProcessing(true, project.status === 'completed')}
                 disabled={busy}
               >
                 {project.status === 'failed'

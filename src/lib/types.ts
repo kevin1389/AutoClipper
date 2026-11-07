@@ -49,15 +49,27 @@ export interface Project {
   updatedAt: string;
 }
 
+export type ClipScoreDimension =
+  | 'hook'
+  | 'engagement'
+  | 'clarity'
+  | 'substance'
+  | 'context'
+  | 'payoff'
+  | 'pacing';
+
 /** Explainable score components (0-1 each) produced by the selector. */
 export interface ClipScoreBreakdown {
   hook: number;
-  entertainment: number;
+  engagement: number;
+  clarity: number;
   substance: number;
   context: number;
   payoff: number;
   pacing: number;
   total: number;
+  /** Older persisted clips used this name before engagement became explicit. */
+  entertainment?: number;
 }
 
 /** User overrides for a rendered clip. Persisted so a re-render is repeatable. */

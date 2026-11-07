@@ -20,12 +20,12 @@ import type { TimedWord } from '../src/lib/types';
 const ffmpeg = ffmpegPath as unknown as string;
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'autoclipper-seek-'));
 
-function makeSource(destination: string): void {
+function makeSource(destination: string, fps = 30): void {
   execFileSync(
     ffmpeg,
     [
       '-y', '-hide_banner', '-loglevel', 'error',
-      '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=12',
+      '-f', 'lavfi', '-i', `testsrc2=size=320x180:rate=${fps}:duration=12`,
       '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono:d=8',
       '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000:duration=4',
       '-filter_complex', '[1:a][2:a]concat=n=2:v=0:a=1[a]',
@@ -41,6 +41,8 @@ function makeSource(destination: string): void {
 
 const sourcePath = path.join(tmpRoot, 'source.mp4');
 makeSource(sourcePath);
+const source24Path = path.join(tmpRoot, 'source-24fps.mp4');
+makeSource(source24Path, 24);
 
 const words: TimedWord[] = [
   { text: 'here', startMs: 8_200, endMs: 8_400 },
@@ -144,6 +146,7 @@ test('subject-following framing and camera moves reach FFmpeg together', async (
   });
   const graph = args[args.indexOf('-filter_complex') + 1];
   assert.match(graph, /crop=\d+:\d+:'[^']*clip\(t\//);
+  assert.match(graph, /crop=\d+:\d+:'[^']*clip\(t\//);
   assert.match(graph, /zoompan=/);
 
   execFileSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', ...args], { stdio: 'pipe' });
@@ -152,6 +155,54 @@ test('subject-following framing and camera moves reach FFmpeg together', async (
   assert.equal(probe.height, 1920);
   assert.equal(probe.hasAudio, true);
   assert.ok(Math.abs(probe.durationMs - plan.outputDurationMs) < 600);
+  assert.ok(
+    Math.abs(probe.videoDurationMs - plan.outputDurationMs) < 600,
+    `video track ${probe.videoDurationMs}ms should match the plan ${plan.outputDurationMs}ms`,
+  );
+});
+
+test('camera moves preserve the video track duration on a 24 fps source', async () => {
+  const plan = buildEditPlan({
+    words,
+    startMs: 8_000,
+    endMs: 12_000,
+    options: { zoomEnabled: true, slowMotionEnabled: false },
+    signals: {
+      audio: [{ tMs: 9_000, rms: -18 }],
+      peaksMs: [9_000, 10_800],
+      sceneChangesMs: [],
+      source: { audio: true, visual: false },
+    },
+    framing: {
+      startX: -0.3,
+      endX: 0.3,
+      confidence: 0.8,
+      strategy: 'subject-following',
+      samples: 4,
+    },
+  });
+  assert.ok(plan.zooms.length > 0, 'the emphasis words should earn a camera move');
+
+  const outputPath = path.join(tmpRoot, '24fps-camera-move.mp4');
+  const args = buildClipRenderArgs({
+    plan,
+    sourceWidth: 320,
+    sourceHeight: 180,
+    source: source24Path,
+    output: outputPath,
+    captionFile: null,
+  });
+  execFileSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', ...args], { stdio: 'pipe' });
+
+  const probe = await probeMedia(outputPath);
+  assert.ok(
+    Math.abs(probe.videoDurationMs - plan.outputDurationMs) < 700,
+    `24 fps camera-move video track was ${probe.videoDurationMs}ms, expected ${plan.outputDurationMs}ms`,
+  );
+  assert.ok(
+    Math.abs(probe.durationMs - plan.outputDurationMs) < 700,
+    `24 fps camera-move container was ${probe.durationMs}ms, expected ${plan.outputDurationMs}ms`,
+  );
 });
 
 test('input-seeked renders keep the planned duration and 9:16 output', async () => {

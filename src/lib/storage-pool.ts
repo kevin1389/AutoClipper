@@ -58,6 +58,10 @@ interface ProviderMeasurement {
   error: string | null;
   /** Last successful measurement, retained across an outage. */
   measuredAt: string | null;
+  /** True only when this call listed the provider and applied the result. */
+  listedNow: boolean;
+  /** How this measurement was produced, for the reconciliation report. */
+  outcome: 'applied' | 'cached' | 'deferred' | 'failed' | 'superseded';
 }
 
 interface MeasurementCacheEntry {
@@ -75,8 +79,37 @@ const measurementCache = (g.__acStorageMeasurements ??= new Map());
 export function resetStorageMeasurementCache(): void {
   measurementCache.clear();
 }
-const MEASUREMENT_TTL_MS = 60_000;
-const FAILED_MEASUREMENT_TTL_MS = 15_000;
+/**
+ * Listing objects is a Class A operation, and Tigris includes only 10,000 of
+ * those per month. Automatic refreshes are deliberately rare, and an upload
+ * reservation never lists at all once provider state exists.
+ */
+const MEASUREMENT_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.AC_STORAGE_MEASURE_TTL_MS) || 30 * 60 * 1000,
+);
+const FAILED_MEASUREMENT_TTL_MS = Math.max(
+  5_000,
+  Number(process.env.AC_STORAGE_FAILED_MEASURE_TTL_MS) || 5 * 60 * 1000,
+);
+/**
+ * Minimum gap between explicit refresh listings. This is a deployment-wide
+ * budget guard, not just double-click protection: any signed-in user can press
+ * "Refresh storage", and a 15-second cooldown would let them exhaust Tigris's
+ * 10,000 monthly Class A allowance within days. Ten minutes still keeps the
+ * button useful and caps forced listings at roughly 4,300 per provider/month.
+ */
+const LIST_COOLDOWN_MS = Math.max(
+  0,
+  Number(process.env.AC_STORAGE_LIST_COOLDOWN_MS) || 10 * 60 * 1000,
+);
+
+/**
+ * 'reconcile' is the once-per-day refresh. It ignores the dashboard TTL (that
+ * is the point of a daily check) but still never lists while an upload holds a
+ * reservation, and it writes through a compare-and-set.
+ */
+type MeasurementReason = 'reservation' | 'dashboard' | 'force' | 'reconcile';
 
 function s3Config(provider: StorageProviderConfig): S3Config {
   return {
@@ -100,12 +133,15 @@ function measurementKey(provider: StorageProviderConfig): string {
 
 async function measureProvider(
   provider: StorageProviderConfig,
-  options: { force?: boolean } = {},
+  options: { reason?: MeasurementReason } = {},
 ): Promise<ProviderMeasurement> {
+  const reason = options.reason ?? 'dashboard';
   const key = measurementKey(provider);
   const cached = measurementCache.get(key);
   const ttl = cached?.value.verified ? MEASUREMENT_TTL_MS : FAILED_MEASUREMENT_TTL_MS;
-  if (!options.force && cached && Date.now() - cached.at < ttl) return cached.value;
+  if (reason !== 'force' && reason !== 'reconcile' && cached && Date.now() - cached.at < ttl) {
+    return cached.value;
+  }
 
   const [complete, reservations, previousState] = await Promise.all([
     db.sumStorageObjectsByProvider(provider.id),
@@ -117,24 +153,87 @@ async function measureProvider(
   // distributed copy, every Worker instance would list every bucket and burn
   // through free-tier request allowances. Uploads still make a real signed S3
   // request and a failed PUT releases its reservation.
-  if (
-    !options.force &&
-    previousState?.verified &&
-    previousState.measuredAt &&
-    Date.now() - new Date(previousState.measuredAt).getTime() < MEASUREMENT_TTL_MS
-  ) {
-    return {
-      provider,
-      verified: true,
-      usedBytes: Math.max(complete.bytes, previousState.listedBytes),
-      objectCount: null,
-      appBytes: complete.bytes,
-      externalBytes: previousState.externalBytes,
-      reservedBytes: reservations.bytes,
-      pendingUploads: reservations.count,
-      error: null,
-      measuredAt: previousState.measuredAt,
-    };
+  const persisted = (
+    verified: boolean,
+    usedBytes: number | null,
+    measuredAt: string | null,
+    error: string | null,
+    outcome: ProviderMeasurement['outcome'] = 'cached',
+  ): ProviderMeasurement => ({
+    provider,
+    verified,
+    usedBytes,
+    objectCount: null,
+    appBytes: complete.bytes,
+    externalBytes: previousState?.externalBytes ?? null,
+    reservedBytes: reservations.bytes,
+    pendingUploads: reservations.count,
+    error,
+    measuredAt,
+    listedNow: false,
+    outcome,
+  });
+
+  const persistState = async (state: {
+    listedBytes: number;
+    externalBytes: number;
+    verified: boolean;
+    measuredAt: string | null;
+    lastError: string | null;
+  }): Promise<boolean> => {
+    if (reason === 'reconcile') {
+      // Compare-and-set against the row this run read: a dashboard refresh that
+      // finished while the listing was in flight is newer than this result.
+      return db.compareAndSetStorageProviderState({
+        providerId: provider.id,
+        ...state,
+        expectedUpdatedAt: previousState?.updatedAt ?? null,
+      });
+    }
+    await db.setStorageProviderState({ providerId: provider.id, ...state });
+    return true;
+  };
+
+  // A daily listing must not run while bytes are reserved. An in-flight object
+  // can appear in the listing while its full size is also reserved, so the two
+  // numbers would describe the same bytes twice. Defer instead of guessing.
+  if (reason === 'reconcile' && reservations.count > 0) {
+    return persisted(
+      previousState?.verified ?? false,
+      previousState?.verified ? Math.max(complete.bytes, previousState.listedBytes) : null,
+      previousState?.measuredAt ?? null,
+      previousState?.verified ? null : (previousState?.lastError ?? null),
+      'deferred',
+    );
+  }
+
+  // A reservation must never trigger a listing. The D1 ledger plus the last
+  // listed total already bound the cap, and listing per upload would exhaust
+  // Tigris's monthly Class A allowance within days.
+  if (reason === 'reservation' && previousState) {
+    return persisted(
+      previousState.verified,
+      previousState.verified ? Math.max(complete.bytes, previousState.listedBytes) : null,
+      previousState.measuredAt,
+      previousState.verified ? null : previousState.lastError,
+    );
+  }
+
+  const lastMeasuredAt = previousState?.measuredAt
+    ? new Date(previousState.measuredAt).getTime()
+    : 0;
+  const age = lastMeasuredAt > 0 ? Date.now() - lastMeasuredAt : Number.POSITIVE_INFINITY;
+  // Dashboard reads refresh on the long TTL; an explicit refresh still has a
+  // short cooldown so repeated clicks cannot fan out into repeated listings.
+  const minimumInterval =
+    reason === 'reconcile' ? 0 : reason === 'force' ? LIST_COOLDOWN_MS : MEASUREMENT_TTL_MS;
+  if (previousState?.verified && age < minimumInterval) {
+    return persisted(
+      true,
+      Math.max(complete.bytes, previousState.listedBytes),
+      previousState.measuredAt,
+      null,
+    );
   }
 
   let measurement: ProviderMeasurement;
@@ -147,39 +246,68 @@ async function measureProvider(
     const usedBytes = listing.objects.reduce((total, object) => total + object.size, 0);
     const externalBytes = Math.max(0, usedBytes - complete.bytes);
     const measuredAt = new Date().toISOString();
-    await db.setStorageProviderState({
-      providerId: provider.id,
+    // Re-check reservations after the listing: one may have started while the
+    // listing ran, which would make its numbers ambiguous against the caps.
+    const activeAfterListing =
+      reason === 'reconcile'
+        ? await db.sumActiveStorageReservationsByProvider(provider.id)
+        : null;
+    if (activeAfterListing && activeAfterListing.count > 0) {
+      const fresh = await db.getStorageProviderState(provider.id);
+      return persisted(
+        fresh?.verified ?? false,
+        fresh?.verified ? Math.max(complete.bytes, fresh.listedBytes) : null,
+        fresh?.measuredAt ?? null,
+        fresh?.verified ? null : (fresh?.lastError ?? null),
+        'deferred',
+      );
+    }
+    const applied = await persistState({
       listedBytes: usedBytes,
       externalBytes,
       verified: true,
       measuredAt,
       lastError: null,
     });
-    measurement = {
-      provider,
-      verified: true,
-      usedBytes,
-      objectCount: listing.objects.length,
-      appBytes: complete.bytes,
-      externalBytes,
-      reservedBytes: reservations.bytes,
-      pendingUploads: reservations.count,
-      error: null,
-      measuredAt,
-    };
+    if (!applied) {
+      // Another measurement won the write. Report its numbers rather than
+      // overwriting a fresher result with this one.
+      const fresh = await db.getStorageProviderState(provider.id);
+      measurement = persisted(
+        fresh?.verified ?? false,
+        fresh?.verified ? Math.max(complete.bytes, fresh.listedBytes) : null,
+        fresh?.measuredAt ?? null,
+        fresh?.verified ? null : (fresh?.lastError ?? null),
+        'superseded',
+      );
+    } else {
+      measurement = {
+        provider,
+        verified: true,
+        usedBytes,
+        objectCount: listing.objects.length,
+        appBytes: complete.bytes,
+        externalBytes,
+        reservedBytes: reservations.bytes,
+        pendingUploads: reservations.count,
+        error: null,
+        measuredAt,
+        listedNow: true,
+        outcome: 'applied',
+      };
+    }
   } catch (error) {
     const message = errorMessage(error);
     // Preserve the last successful external-bytes baseline. Replacing it with
     // zero after an outage would undercount capacity if a reservation were
     // somehow attempted before the next successful listing.
-    await db.setStorageProviderState({
-      providerId: provider.id,
+    await persistState({
       listedBytes: previousState?.listedBytes ?? 0,
       externalBytes: previousState?.externalBytes ?? 0,
       verified: false,
       measuredAt: previousState?.measuredAt ?? null,
       lastError: message,
-    }).catch(() => undefined);
+    }).catch(() => false);
     measurement = {
       provider,
       verified: false,
@@ -191,13 +319,17 @@ async function measureProvider(
       pendingUploads: reservations.count,
       error: message,
       measuredAt: previousState?.measuredAt ?? null,
+      listedNow: false,
+      outcome: 'failed',
     };
   }
   measurementCache.set(key, { value: measurement, at: Date.now() });
   return measurement;
 }
 
-async function measurePool(options: { force?: boolean } = {}): Promise<ProviderMeasurement[]> {
+async function measurePool(
+  options: { reason?: MeasurementReason } = {},
+): Promise<ProviderMeasurement[]> {
   return Promise.all(storageProviders().map((provider) => measureProvider(provider, options)));
 }
 
@@ -233,6 +365,15 @@ const RESERVATION_TTL_MS = Math.max(
   Number(process.env.AC_STORAGE_RESERVATION_TTL_MS) || 24 * 60 * 60 * 1000,
 );
 
+/**
+ * Provider attempts per logical upload. One attempt per provider by default,
+ * bounded so a future provider list cannot turn one failure into a long storm.
+ */
+const MAX_UPLOAD_ATTEMPTS = Math.max(
+  1,
+  Math.min(5, Number(process.env.AC_UPLOAD_PROVIDER_ATTEMPTS) || 3),
+);
+
 async function releaseObjectReservation(objectId: string): Promise<void> {
   await db.releaseActiveReservationsForObject(objectId).catch(() => undefined);
 }
@@ -252,11 +393,16 @@ async function discardObject(provider: StorageProviderConfig, key: string): Prom
  * process-local mutex could not coordinate requests handled by different
  * Worker isolates, so it has been removed entirely.
  */
-async function reserveUpload(input: ReservationInput): Promise<Reservation> {
+async function reserveUpload(
+  input: ReservationInput,
+  excluded: ReadonlySet<string> = new Set(),
+): Promise<Reservation> {
   // Expired multipart sessions are cleaned before adding a new reservation.
   // The limit keeps a normal upload from listing every abandoned session.
   await cleanupExpiredStorageUploads(5).catch(() => undefined);
-  const measurements = await measurePool();
+  // Reservations read persisted state only: no provider listing is performed
+  // here, so retries and failover cannot inflate the LIST request count.
+  const measurements = await measurePool({ reason: 'reservation' });
   if (measurements.length === 0) {
     throw new StoragePoolUnavailableError('No S3 storage providers are configured.');
   }
@@ -265,6 +411,7 @@ async function reserveUpload(input: ReservationInput): Promise<Reservation> {
 
   for (const measurement of measurements) {
     const { provider } = measurement;
+    if (excluded.has(provider.id)) continue;
     if (!measurement.verified) {
       reasons.push(`${provider.label} is unavailable`);
       continue;
@@ -383,59 +530,97 @@ export async function uploadStorageObject(input: {
   if (input.expectedBytes !== null && input.expectedBytes <= 0) {
     throw new Error('The upload is empty.');
   }
-  const reservation = await reserveUpload({
-    ownerId: input.ownerId,
-    projectId: input.projectId,
-    clipId: input.clipId ?? null,
-    kind: input.kind,
-    assetKey: input.assetKey,
-    key: input.key,
-    contentType: input.contentType,
-    expectedBytes: input.expectedBytes ?? input.maxBytes,
-  });
-  if (reservation.completed) return reservation.record;
 
-  let objectMayExist = false;
-  try {
-    await s3PutObject(
-      s3Config(reservation.provider),
-      input.key,
-      input.body,
-      input.maxBytes,
-      input.contentType,
-      input.expectedBytes,
+  const tried = new Set<string>();
+  let lastError: unknown = null;
+  // A ReadableStream can only be read once. While another provider might still
+  // be tried, tee the body so a failed attempt leaves a replayable branch
+  // instead of uploading a half-consumed stream.
+  let pendingBody: ReadableStream<Uint8Array> = input.body;
+
+  for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt += 1) {
+    const candidates = storageProviders().filter((provider) => !tried.has(provider.id));
+    if (candidates.length === 0) break;
+
+    const reservation = await reserveUpload(
+      {
+        ownerId: input.ownerId,
+        projectId: input.projectId,
+        clipId: input.clipId ?? null,
+        kind: input.kind,
+        assetKey: input.assetKey,
+        key: input.key,
+        contentType: input.contentType,
+        expectedBytes: input.expectedBytes ?? input.maxBytes,
+      },
+      tried,
     );
-    objectMayExist = true;
-    const head = await s3HeadObject(s3Config(reservation.provider), input.key);
-    if (!head || head.size <= 0) throw new Error('The provider did not receive a complete object.');
-    if (input.expectedBytes !== null && head.size !== input.expectedBytes) {
-      throw new Error(`Provider verification found ${head.size} bytes; expected ${input.expectedBytes}.`);
+    if (reservation.completed) return reservation.record;
+
+    let attemptBody = pendingBody;
+    if (candidates.length > 1) {
+      const [current, replay] = pendingBody.tee();
+      attemptBody = current;
+      pendingBody = replay;
     }
-    const completedAt = new Date().toISOString();
-    await db.updateStorageObject(reservation.record.id, {
-      bytes: head.size,
-      status: 'complete',
-      lastError: null,
-      completedAt,
-    });
-    await releaseObjectReservation(reservation.record.id);
-    measurementCache.delete(measurementKey(reservation.provider));
-    return (await db.getStorageObject(reservation.record.id)) as StorageObjectRecord;
-  } catch (error) {
-    const removed = objectMayExist
-      ? await discardObject(reservation.provider, input.key)
-      : true;
-    if (removed) await releaseObjectReservation(reservation.record.id);
-    await db
-      .updateStorageObject(reservation.record.id, {
-        status: removed ? 'failed' : 'uploading',
-        lastError: removed
-          ? errorMessage(error)
-          : `${errorMessage(error)} The provider would not confirm removal, so the bytes remain reserved.`,
-      })
-      .catch(() => undefined);
-    throw error;
+
+    try {
+      await s3PutObject(
+        s3Config(reservation.provider),
+        input.key,
+        attemptBody,
+        input.maxBytes,
+        input.contentType,
+        input.expectedBytes,
+      );
+      const head = await s3HeadObject(s3Config(reservation.provider), input.key);
+      if (!head || head.size <= 0) throw new Error('The provider did not receive a complete object.');
+      if (input.expectedBytes !== null && head.size !== input.expectedBytes) {
+        throw new Error(`Provider verification found ${head.size} bytes; expected ${input.expectedBytes}.`);
+      }
+      const completedAt = new Date().toISOString();
+      await db.updateStorageObject(reservation.record.id, {
+        bytes: head.size,
+        status: 'complete',
+        lastError: null,
+        completedAt,
+      });
+      await releaseObjectReservation(reservation.record.id);
+      measurementCache.delete(measurementKey(reservation.provider));
+      return (await db.getStorageObject(reservation.record.id)) as StorageObjectRecord;
+    } catch (error) {
+      lastError = error;
+      // A rejected PUT can still have stored bytes. Always confirm absence
+      // before releasing, and never fail over while an object may remain: an
+      // orphan on the old provider would be untracked and uncounted.
+      if (!(await discardObject(reservation.provider, input.key))) {
+        await db
+          .updateStorageObject(reservation.record.id, {
+            status: 'uploading',
+            lastError: `${errorMessage(error)} The provider would not confirm removal, so the bytes remain reserved and no failover was attempted.`,
+          })
+          .catch(() => undefined);
+        measurementCache.delete(measurementKey(reservation.provider));
+        throw error;
+      }
+      try {
+        await db.updateStorageObject(reservation.record.id, {
+          status: 'failed',
+          lastError: errorMessage(error),
+        });
+      } finally {
+        // Always release once removal is confirmed, even if the ledger write
+        // fails; an active reservation must never outlive its object.
+        await releaseObjectReservation(reservation.record.id);
+      }
+      measurementCache.delete(measurementKey(reservation.provider));
+      tried.add(reservation.provider.id);
+    }
   }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('No storage provider accepted this upload.');
 }
 
 export async function startMultipartStorageObject(input: {
@@ -449,50 +634,80 @@ export async function startMultipartStorageObject(input: {
   partSize: number;
   totalParts: number;
 }): Promise<{ providerId: string; uploadId: string; record: StorageObjectRecord }> {
-  const reservation = await reserveUpload({
-    ownerId: input.ownerId,
-    projectId: input.projectId,
-    kind: input.kind,
-    assetKey: input.assetKey,
-    key: input.key,
-    contentType: input.contentType,
-    expectedBytes: input.expectedBytes,
-    partSize: input.partSize,
-    totalParts: input.totalParts,
-  });
-  if (reservation.completed) throw new Error('This upload was already completed.');
+  const tried = new Set<string>();
+  let lastError: unknown = null;
 
-  let uploadId: string | null = null;
-  try {
-    uploadId = await s3CreateMultipart(
-      s3Config(reservation.provider),
-      input.key,
-      input.contentType,
+  for (let attempt = 1; attempt <= MAX_UPLOAD_ATTEMPTS; attempt += 1) {
+    if (storageProviders().every((provider) => tried.has(provider.id))) break;
+
+    const reservation = await reserveUpload(
+      {
+        ownerId: input.ownerId,
+        projectId: input.projectId,
+        kind: input.kind,
+        assetKey: input.assetKey,
+        key: input.key,
+        contentType: input.contentType,
+        expectedBytes: input.expectedBytes,
+        partSize: input.partSize,
+        totalParts: input.totalParts,
+      },
+      tried,
     );
-    await db.updateStorageObject(reservation.record.id, {
-      uploadId,
-      status: 'uploading',
-      lastError: null,
-    });
-    measurementCache.delete(measurementKey(reservation.provider));
-    return {
-      providerId: reservation.provider.id,
-      uploadId,
-      record: (await db.getStorageObject(reservation.record.id)) as StorageObjectRecord,
-    };
-  } catch (error) {
-    if (uploadId) {
-      await s3AbortMultipart(s3Config(reservation.provider), input.key, uploadId).catch(() => undefined);
+    if (reservation.completed) throw new Error('This upload was already completed.');
+
+    let uploadId: string | null = null;
+    try {
+      uploadId = await s3CreateMultipart(
+        s3Config(reservation.provider),
+        input.key,
+        input.contentType,
+      );
+      await db.updateStorageObject(reservation.record.id, {
+        uploadId,
+        status: 'uploading',
+        lastError: null,
+      });
+      measurementCache.delete(measurementKey(reservation.provider));
+      return {
+        providerId: reservation.provider.id,
+        uploadId,
+        record: (await db.getStorageObject(reservation.record.id)) as StorageObjectRecord,
+      };
+    } catch (error) {
+      lastError = error;
+      if (uploadId) {
+        await s3AbortMultipart(s3Config(reservation.provider), input.key, uploadId).catch(
+          () => undefined,
+        );
+      }
+      if (!(await discardObject(reservation.provider, input.key))) {
+        await db
+          .updateStorageObject(reservation.record.id, {
+            status: 'uploading',
+            lastError: `${errorMessage(error)} The provider would not confirm removal, so the bytes remain reserved and no failover was attempted.`,
+          })
+          .catch(() => undefined);
+        measurementCache.delete(measurementKey(reservation.provider));
+        throw error;
+      }
+      try {
+        await db.updateStorageObject(reservation.record.id, {
+          status: 'failed',
+          uploadId: null,
+          lastError: errorMessage(error),
+        });
+      } finally {
+        await releaseObjectReservation(reservation.record.id);
+      }
+      measurementCache.delete(measurementKey(reservation.provider));
+      tried.add(reservation.provider.id);
     }
-    await releaseObjectReservation(reservation.record.id);
-    await db
-      .updateStorageObject(reservation.record.id, {
-        status: 'failed',
-        lastError: errorMessage(error),
-      })
-      .catch(() => undefined);
-    throw error;
   }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error('No storage provider accepted this upload.');
 }
 
 async function multipartRecord(projectId: string, uploadId: string): Promise<{
@@ -513,6 +728,21 @@ export async function uploadMultipartPart(
   body: ArrayBuffer,
 ): Promise<S3Part> {
   const { record, provider } = await multipartRecord(projectId, uploadId);
+  // A session may only accept the parts its declared size implies. Without
+  // this, a caller could keep uploading parts far past the reserved bytes,
+  // consuming provider quota the capacity ledger never accounted for.
+  if (record.status !== 'uploading') throw new Error('This upload is not accepting parts.');
+  if (!Number.isInteger(partNumber) || partNumber < 1) {
+    throw new Error('Invalid upload part number.');
+  }
+  if (record.totalParts !== null && partNumber > record.totalParts) {
+    throw new Error(
+      `Part ${partNumber} is beyond the ${record.totalParts} parts this upload declared.`,
+    );
+  }
+  if (record.partSize !== null && body.byteLength > record.partSize + 1024) {
+    throw new Error(`Part ${partNumber} exceeds the ${record.partSize}-byte part size.`);
+  }
   let lastError: unknown = null;
   // A failed part is independent of the rest of the multipart session. Retry
   // the same part number; S3 replaces that part, so this cannot duplicate data.
@@ -857,6 +1087,7 @@ function providerUsage(
   limitBytes: number,
   reserveBytes: number,
   role: StorageProviderUsage['role'],
+  reconciledAt: string | null,
 ): StorageProviderUsage {
   if (!definition || !measurement) {
     return {
@@ -877,6 +1108,7 @@ function providerUsage(
       availableBytes: null,
       error: 'Not configured. Add this provider’s server-side secrets to enable it.',
       measuredAt: null,
+      reconciledAt,
     };
   }
   const used = measurement.verified ? measurement.usedBytes : null;
@@ -901,6 +1133,7 @@ function providerUsage(
         : Math.max(0, definition.safeLimitBytes - used - measurement.reservedBytes),
     error: measurement.error,
     measuredAt: measurement.measuredAt,
+    reconciledAt,
   };
 }
 
@@ -913,9 +1146,23 @@ export async function getPoolStorageUsage(
     await cleanupExpiredStorageUploads(25).catch(() => undefined);
   }
   const configured = storageProviders();
-  const measurements = await measurePool(options);
-  const measurementById = new Map(measurements.map((entry) => [entry.provider.id, entry]));
   const definitions = STORAGE_PROVIDER_DEFINITIONS;
+  // A forced refresh is still a dashboard read: only "force" may bypass the
+  // long TTL, and even then the listing cooldown applies.
+  const [measurements, reconciliations] = await Promise.all([
+    measurePool({ reason: options.force ? 'force' : 'dashboard' }),
+    Promise.all(
+      definitions.map((definition) =>
+        db.getStorageReconciliation(definition.id).catch(() => null),
+      ),
+    ),
+  ]);
+  const measurementById = new Map(measurements.map((entry) => [entry.provider.id, entry]));
+  const reconciliationById = new Map(
+    reconciliations
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null)
+      .map((entry) => [entry.providerId, entry]),
+  );
   const providers: StorageProviderUsage[] = definitions.map((definition) => {
     const config = configured.find((entry) => entry.id === definition.id);
     return providerUsage(
@@ -926,6 +1173,7 @@ export async function getPoolStorageUsage(
       config?.limitBytes ?? definition.defaultLimitBytes,
       config?.reserveBytes ?? definition.defaultReserveBytes,
       config?.role ?? definition.role,
+      reconciliationById.get(definition.id)?.lastSuccessAt ?? null,
     );
   });
 
@@ -1016,6 +1264,7 @@ export async function getPoolStorageUsage(
     providers,
     configuredCapacityBytes,
     verifiedCapacityBytes,
+    unverifiedCapacityBytes: Math.max(0, configuredCapacityBytes - verifiedCapacityBytes),
     totalUsedBytes,
     totalAvailableBytes: allocationAvailableBytes,
     reservedBytes: totalReservedBytes,
@@ -1024,6 +1273,38 @@ export async function getPoolStorageUsage(
     failedDeletions: failures.failedDeletions,
     lastSuccessfulMeasurement,
     targetVerified,
+  };
+}
+
+export interface ProviderReconciliationMeasurement {
+  providerId: string;
+  verified: boolean;
+  usedBytes: number | null;
+  outcome: ProviderMeasurement['outcome'];
+  deferred: boolean;
+  error: string | null;
+  measuredAt: string | null;
+}
+
+/**
+ * One provider's daily listing. Unlike a dashboard read this ignores the TTL,
+ * but it never lists while bytes are reserved and it only writes through a
+ * compare-and-set, so a slow run cannot resurrect stale usage.
+ */
+export async function reconcileProviderMeasurement(
+  providerId: string,
+): Promise<ProviderReconciliationMeasurement | null> {
+  const provider = storageProviders().find((entry) => entry.id === providerId);
+  if (!provider) return null;
+  const measurement = await measureProvider(provider, { reason: 'reconcile' });
+  return {
+    providerId: provider.id,
+    verified: measurement.verified,
+    usedBytes: measurement.usedBytes,
+    outcome: measurement.outcome,
+    deferred: measurement.outcome === 'deferred',
+    error: measurement.error,
+    measuredAt: measurement.measuredAt,
   };
 }
 

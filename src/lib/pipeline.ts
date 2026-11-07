@@ -283,7 +283,7 @@ export async function runPipeline(options: RunPipelineOptions): Promise<RunPipel
     // Selection and the edit planner both use them; empty is a valid answer.
     const signals = await loadMediaSignals(projectId, sourcePath, dirs.work);
 
-    await report('select', 0.3, 'Scoring candidate moments for hooks, context and payoff');
+    await report('select', 0.3, 'Scoring hooks, engagement, clarity, context, payoff and pacing; ranking strongest first');
     let selectionEngine = selector.label;
     let selected: SelectedClip[] = [];
     try {

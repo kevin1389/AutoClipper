@@ -18,14 +18,22 @@ export interface MockS3 {
   endpoint: string;
   buckets: string[];
   failPuts: boolean;
+  /** Fails direct PUTs for specific buckets, to exercise provider failover. */
+  failPutsFor: Set<string>;
   failDeletes: Set<string>;
   failBucketChecks: Set<string>;
+  /** Fails LIST for specific buckets, to exercise a failed reconciliation. */
+  failLists: Set<string>;
   failNextPart: boolean;
   lastAuthorization: string | null;
   signatureFailures: number;
   objectCount(bucket: string): number;
   multipartUploadCount(): number;
   objectData(bucket: string, key: string): Buffer | null;
+  /** Direct PUT attempts, including rejected ones, for failover/retry counts. */
+  putAttempts(bucket: string): number;
+  /** LIST requests, to prove uploads and cached reads do not re-list. */
+  listRequests(bucket: string): number;
   reset(): void;
   close(): Promise<void>;
 }
@@ -173,8 +181,12 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
 
   const state = {
     failPuts: false,
+    failPutsFor: new Set<string>(),
+    putAttempts: new Map<string, number>(),
+    listRequests: new Map<string, number>(),
     failDeletes: new Set<string>(),
     failBucketChecks: new Set<string>(),
+    failLists: new Set<string>(),
     failNextPart: false,
     lastAuthorization: null as string | null,
     signatureFailures: 0,
@@ -218,6 +230,11 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
 
     if (req.method === 'GET' && !key && url.searchParams.get('list-type') === '2') {
       if (failBucket()) return;
+      state.listRequests.set(bucket, (state.listRequests.get(bucket) ?? 0) + 1);
+      if (state.failLists.has(bucket)) {
+        sendError(res, 500, 'InternalError', 'Simulated list failure.');
+        return;
+      }
       const prefix = url.searchParams.get('prefix') ?? '';
       const entries = [...bucketObjects.entries()].filter(([name]) => name.startsWith(prefix));
       const contents = entries
@@ -308,7 +325,8 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
 
     if (req.method === 'PUT' && key) {
       if (failBucket()) return;
-      if (state.failPuts) {
+      state.putAttempts.set(bucket, (state.putAttempts.get(bucket) ?? 0) + 1);
+      if (state.failPuts || state.failPutsFor.has(bucket)) {
         sendError(res, 500, 'InternalError', 'Simulated upload failure.');
         return;
       }
@@ -325,6 +343,7 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
 
     const existing = key ? bucketObjects.get(key) : undefined;
     if (req.method === 'HEAD' && key) {
+      if (failBucket()) return;
       if (!existing) {
         res.writeHead(404);
         res.end();
@@ -340,6 +359,7 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
     }
 
     if (req.method === 'GET' && key) {
+      if (failBucket()) return;
       if (!existing) {
         sendError(res, 404, 'NoSuchKey', 'The object does not exist.');
         return;
@@ -395,8 +415,10 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
     set failPuts(value: boolean) {
       state.failPuts = value;
     },
+    failPutsFor: state.failPutsFor,
     failDeletes: state.failDeletes,
     failBucketChecks: state.failBucketChecks,
+    failLists: state.failLists,
     get failNextPart() {
       return state.failNextPart;
     },
@@ -418,12 +440,22 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
     objectData(bucket: string, key: string) {
       return objects.get(bucket)?.get(key)?.data ?? null;
     },
+    putAttempts(bucket: string) {
+      return state.putAttempts.get(bucket) ?? 0;
+    },
+    listRequests(bucket: string) {
+      return state.listRequests.get(bucket) ?? 0;
+    },
     reset() {
       for (const bucketObjects of objects.values()) bucketObjects.clear();
       uploads.clear();
       state.failPuts = false;
+      state.failPutsFor.clear();
+      state.putAttempts.clear();
+      state.listRequests.clear();
       state.failDeletes.clear();
       state.failBucketChecks.clear();
+      state.failLists.clear();
       state.failNextPart = false;
       state.lastAuthorization = null;
       state.signatureFailures = 0;

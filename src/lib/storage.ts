@@ -308,6 +308,7 @@ function summarizeUsage(
     providers: [],
     configuredCapacityBytes: limitBytes,
     verifiedCapacityBytes: limitBytes,
+    unverifiedCapacityBytes: 0,
     totalUsedBytes: usedBytes,
     totalAvailableBytes: Math.max(0, limitBytes - usedBytes),
     reservedBytes: 0,
@@ -346,6 +347,7 @@ function unavailableUsage(
     providers: [],
     configuredCapacityBytes: limitBytes,
     verifiedCapacityBytes: 0,
+    unverifiedCapacityBytes: limitBytes,
     totalUsedBytes: 0,
     totalAvailableBytes: 0,
     reservedBytes: 0,
@@ -677,13 +679,12 @@ export async function pathExists(target: string): Promise<boolean> {
 
 export async function fileSize(target: string): Promise<number | null> {
   if (isProviderObjectPath(target)) {
-    try {
-      const { config: s3Config, key } = s3ForPath(target);
-      const head = await s3HeadObject(s3Config, key);
-      return head ? head.size : null;
-    } catch {
-      return null;
-    }
+    // A provider HEAD can fail because of quota, auth or a transient outage.
+    // Those are not proof that the object is missing; let the route report a
+    // storage failure instead of manufacturing a 404.
+    const { config: s3Config, key } = s3ForPath(target);
+    const head = await s3HeadObject(s3Config, key);
+    return head ? head.size : null;
   }
   const files = await filesBinding();
   if (files && isBlobKey(target)) {

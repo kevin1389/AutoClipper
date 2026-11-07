@@ -43,7 +43,7 @@ async function handlePost(request: Request): Promise<Response> {
     );
   }
 
-  const limit = takeRateLimit(`forgot:${clientKey(request)}:${email}`, 5, 15 * 60_000);
+  const limit = await takeRateLimit(`forgot:${clientKey(request)}:${email}`, 5, 15 * 60_000);
   if (!limit.ok) {
     return NextResponse.json(
       { error: 'Too many reset requests. Wait a few minutes and try again.', code: 'rate_limited' },

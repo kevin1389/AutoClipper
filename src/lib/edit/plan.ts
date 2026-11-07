@@ -50,7 +50,9 @@ export const DEFAULT_EDITS: ClipEdits = {
   captionText: null,
   zoomEnabled: true,
   zoomIntensity: 1,
-  slowMotionEnabled: true,
+  // Slow motion is an opt-in accent, never a default edit. Most talking-head
+  // moments read as more natural at their original speed.
+  slowMotionEnabled: false,
 };
 
 const MIN_PAUSE_MS = 900;
@@ -59,6 +61,8 @@ const EDGE_PAD_START_MS = 220;
 const EDGE_PAD_END_MS = 380;
 const SLOW_SPEED = 0.55;
 const SLOW_MAX_MS = 1_800;
+export const MIN_ZOOM_SCALE = 1.03;
+export const MAX_ZOOM_SCALE = 1.1;
 
 const EMPHASIS_WORDS = new Set([
   'crazy', 'insane', 'wild', 'unbelievable', 'shocking', 'shocked', 'hilarious', 'funny',
@@ -249,6 +253,8 @@ export function buildEditPlan(input: {
   // 5. Smooth camera moves on emphasis anchors, spaced out and never on top of each other.
   const zooms: ClipZoomWindow[] = [];
   if (options.zoomEnabled) {
+    // A short clip gets at most two moves; only a longer clip can earn three.
+    const maxZooms = outputDurationMs >= 30_000 ? 3 : 2;
     const anchors: { atMs: number; score: number; reason: string }[] = [];
     for (const word of words) {
       const score = emphasisScore(word.text);
@@ -270,7 +276,10 @@ export function buildEditPlan(input: {
     anchors.sort((a, b) => b.score - a.score);
 
     for (const anchor of anchors) {
-      if (zooms.length >= 3) break;
+      if (zooms.length >= maxZooms) break;
+      // A visual cut by itself is not enough reason to move the frame. Keep the
+      // camera still unless an emphatic line or an audio peak supports the move.
+      if (anchor.score < 0.6) continue;
       const outMs = mapSourceTime(anchor.atMs);
       if (outMs < 650 || outMs > outputDurationMs - 1_100) continue;
       const windowStart = Math.round(clamp(outMs - 450, 0, outputDurationMs - 1_100));
@@ -280,7 +289,9 @@ export function buildEditPlan(input: {
       zooms.push({
         startMs: windowStart,
         endMs: windowEnd,
-        scale: Math.round((1 + 0.05 * intensity) * 1000) / 1000,
+        // Keep punch-ins barely perceptible but still visible. Intensity 0.4–2
+        // maps to 1.03×–1.10×; the renderer enforces the same ceiling.
+        scale: Math.round(clamp(1 + 0.05 * intensity, MIN_ZOOM_SCALE, MAX_ZOOM_SCALE) * 1000) / 1000,
         reason: anchor.reason,
       });
     }
@@ -359,5 +370,5 @@ export function buildZoomExpression(zooms: ClipZoomWindow[], _intensity = 1): st
     const easeOut = `(${leaving}*${leaving}*(3-2*${leaving}))`;
     return `${amplitude.toFixed(4)}*${easeIn}*${easeOut}`;
   });
-  return `min(1.15,1+${parts.join('+')})`;
+  return `min(${MAX_ZOOM_SCALE.toFixed(2)},1+${parts.join('+')})`;
 }

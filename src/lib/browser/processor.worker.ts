@@ -7,11 +7,13 @@ import { selectHighlightsHeuristically } from '../ai/heuristic';
 import { finalizeSelection } from '../ai/select-utils';
 import type { ClipEdits, ClipEffects, ClipFraming, ClipView, PipelineStage, TimedWord } from '../types';
 import { decodeWav, segmentsFromWords, signalsFromSamples, type DecodedAudio } from './audio';
-import type { BrowserSignals, RenderClipMessage, StartMessage, WorkerEvent, WorkerRequest } from './protocol';
+import type { BrowserSignals, PosterResponse, RenderClipMessage, StartMessage, WorkerEvent, WorkerRequest } from './protocol';
 import { BrowserTranscriber, ModelLoadError } from './transcribe';
 import { retrySection } from './section-retry';
-import { BrowserFfmpeg } from './ffmpeg-core';
+import { BrowserFfmpeg, isFfmpegCoreError } from './ffmpeg-core';
 import { buildClipRenderArgs } from './render-command';
+import { isJpeg } from '../poster';
+import { progressFor } from '../stages';
 import { MAX_SOURCE_BYTES } from '../upload-limits';
 
 const SOURCE_PATH = '/source/input.mp4';
@@ -34,14 +36,86 @@ interface Session {
   hasAudio: boolean;
 }
 
+interface ProcessorClip {
+  id: string;
+  index: number;
+  title: string;
+  startMs: number;
+  endMs: number;
+  status: 'pending' | 'rendered' | 'failed';
+  edits?: ClipEdits | null;
+}
+
 let ffmpeg: BrowserFfmpeg | null = null;
 let transcriber: BrowserTranscriber | null = null;
 let session: Session | null = null;
 let logs: string[] = [];
 let cancelled = false;
+let sourceBlob: Blob | File | null = null;
+let lastProgress = 0;
+let runStartedAt = 0;
+let markAt = 0;
+let currentClipNumber: number | null = null;
+
+function mark(label: string): void {
+  const now = performance.now();
+  console.info(`[ac-timing] ${label} ${Math.round(now - markAt)}ms (total ${Math.round(now - runStartedAt)}ms)`);
+  markAt = now;
+}
 
 function send(event: WorkerEvent) {
   self.postMessage(event);
+}
+
+interface PosterWaiter {
+  resolve: (poster: Uint8Array) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+const posterWaiters = new Map<string, PosterWaiter>();
+
+/**
+ * The page owns the browser's native video decoder. FFmpeg.wasm can render a
+ * clip and then trap while decoding that same MP4 for a poster, so the exact
+ * rendered bytes are copied to the main thread for a canvas capture.
+ */
+function requestPosterFromMainThread(video: Uint8Array, clipNumber: number): Promise<Uint8Array> {
+  return new Promise((resolve, reject) => {
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const copy = video.slice();
+    const buffer = copy.buffer as ArrayBuffer;
+    const timer = setTimeout(() => {
+      posterWaiters.delete(requestId);
+      reject(new Error(`The browser did not return a poster for clip ${clipNumber} within 30 seconds.`));
+    }, 30_000);
+    posterWaiters.set(requestId, { resolve, reject, timer });
+    self.postMessage(
+      { type: 'poster-request', requestId, clipNumber, video: buffer } satisfies WorkerEvent,
+      [buffer],
+    );
+  });
+}
+
+function resolvePosterResponse(response: PosterResponse): void {
+  const waiter = posterWaiters.get(response.requestId);
+  if (!waiter) return;
+  clearTimeout(waiter.timer);
+  posterWaiters.delete(response.requestId);
+  if (response.error) {
+    waiter.reject(new Error(response.error));
+    return;
+  }
+  if (!response.poster || response.poster.byteLength === 0) {
+    waiter.reject(new Error('The browser returned no poster image.'));
+    return;
+  }
+  const poster = new Uint8Array(response.poster);
+  if (!isJpeg(poster)) {
+    waiter.reject(new Error('The browser returned a poster that was not a JPEG.'));
+    return;
+  }
+  waiter.resolve(poster);
 }
 
 function fail(error: unknown, fallback = 'Browser processing failed.'): never {
@@ -68,14 +142,26 @@ async function post(url: string, body: unknown) {
   return data;
 }
 
-async function report(projectId: string, stage: import('../types').PipelineStage, progress: number, detail: string) {
-  const clamped = Math.max(0, Math.min(100, Math.round(progress)));
-  send({ type: 'progress', stage: stage as never, progress: clamped, detail });
+/**
+ * Reports one stage fraction using the same weighted timeline the UI renders.
+ * Callers pass 0–1 within a stage; the project always receives 0–100 overall.
+ * Progress is monotonic so a late request cannot move the bar backwards.
+ */
+async function report(
+  projectId: string,
+  stage: Exclude<import('../types').PipelineStage, 'queued' | 'done'>,
+  fraction: number,
+  detail: string,
+) {
+  const bounded = Math.min(1, Math.max(0, Number.isFinite(fraction) ? fraction : 0));
+  const overall = Math.max(lastProgress, progressFor(stage, bounded));
+  lastProgress = overall;
+  send({ type: 'progress', stage, progress: overall, detail });
   try {
     await post(`/api/projects/${projectId}/process`, {
       action: 'progress',
       stage,
-      progress: clamped,
+      progress: overall,
       detail,
     });
   } catch {
@@ -90,7 +176,6 @@ function tailLogs(): string {
 
 async function loadFfmpeg() {
   if (ffmpeg?.loaded) return ffmpeg;
-  send({ type: 'progress', stage: 'probe', progress: 1, detail: 'Loading FFmpeg.wasm' });
   const instance = new BrowserFfmpeg();
   instance.on('log', ({ message }) => {
     logs.push(message);
@@ -109,11 +194,100 @@ async function loadFfmpeg() {
 
 let activeProgress: ((fraction: number) => void) | null = null;
 
+/** Command arguments can include long filter graphs; keep errors readable. */
+function summarizeArgs(args: string[]): string {
+  return args
+    .map((arg) => (arg.length > 180 ? `${arg.slice(0, 180)}…(${arg.length} chars)` : arg))
+    .join(' ');
+}
+
+/**
+ * Recreates the wasm core and remounts the original source. This is used after
+ * a wasm trap and between clips, not as error suppression: if the retry fails,
+ * the real command and stage are reported.
+ */
+async function restartWithBlob(blob: Blob, name: string): Promise<BrowserFfmpeg> {
+  const previous = ffmpeg;
+  previous?.dispose();
+  ffmpeg = null;
+  const instance = await ensureFfmpegFiles();
+  await instance.mountSource(blob, name);
+  return instance;
+}
+
+async function restartFfmpeg(): Promise<BrowserFfmpeg> {
+  if (!sourceBlob) throw new Error('The source is not mounted, so FFmpeg cannot be restarted.');
+  const instance = await restartWithBlob(sourceBlob, 'input.mp4');
+  logs.push(`FFmpeg.wasm core generation ${instance.generation} mounted the source`);
+  return instance;
+}
+
 async function run(args: string[], label: string): Promise<void> {
-  if (!ffmpeg) throw new Error('FFmpeg is not loaded.');
-  const code = await ffmpeg.exec(['-hide_banner', '-loglevel', 'error', ...args]);
-  if (code !== 0) {
-    throw new Error(`${label} failed${tailLogs() ? `: ${tailLogs()}` : ` (FFmpeg exit ${code})`}`);
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const instance = await loadFfmpeg();
+    try {
+      const code = await instance.exec(['-hide_banner', '-loglevel', 'error', ...args]);
+      if (code !== 0) {
+        throw new Error(`${label} failed${tailLogs() ? `: ${tailLogs()}` : ` (FFmpeg exit ${code})`}`);
+      }
+      return;
+    } catch (error) {
+      lastError = error;
+      if (isFfmpegCoreError(error) && attempt === 0) {
+        logs.push(
+          `${label}: FFmpeg core generation ${error.generation} trapped; restarting on a fresh core`,
+        );
+        await restartFfmpeg();
+        continue;
+      }
+      break;
+    }
+  }
+  const detail = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(
+    `${label} failed after ${isFfmpegCoreError(lastError) ? 'restarting FFmpeg.wasm' : 'one attempt'}: ${detail}. ` +
+      `Command: ${summarizeArgs(args).slice(0, 500)}${tailLogs() ? `\n${tailLogs()}` : ''}`,
+    { cause: lastError },
+  );
+}
+
+/** A probe does not produce media, but it still needs the same core recovery. */
+async function runProbe(args: string[], label: string): Promise<void> {
+  let lastError: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const instance = await loadFfmpeg();
+    try {
+      await instance.ffprobe(['-hide_banner', '-loglevel', 'error', ...args]);
+      // @ffmpeg/core 0.12.x's ffprobe entry point returns -1 even when it
+      // successfully writes its report. The caller validates the report file;
+      // treating this status as an exit code rejects every valid probe.
+      return;
+    } catch (error) {
+      lastError = error;
+      if (isFfmpegCoreError(error) && attempt === 0) {
+        logs.push(`${label}: FFprobe core trapped; restarting on a fresh core`);
+        await restartFfmpeg();
+        continue;
+      }
+      break;
+    }
+  }
+  const detail = lastError instanceof Error ? lastError.message : String(lastError);
+  throw new Error(`${label} failed: ${detail}`, { cause: lastError });
+}
+
+/** Reads a probe report and turns a missing/invalid report into a real error. */
+async function readProbeJson(path: string, label: string): Promise<Record<string, unknown>> {
+  const active = await loadFfmpeg();
+  try {
+    const raw = await active.readFile(path, 'utf8');
+    return JSON.parse(String(raw)) as Record<string, unknown>;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `${label} produced no readable JSON report: ${detail}${tailLogs() ? `\n${tailLogs()}` : ''}`,
+    );
   }
 }
 
@@ -138,6 +312,17 @@ async function fetchSourceBlob(
   return blob;
 }
 
+const volatileFiles = new Map<string, string | Uint8Array>();
+
+async function writeVolatileFile(
+  instance: BrowserFfmpeg,
+  path: string,
+  data: string | Uint8Array,
+): Promise<void> {
+  volatileFiles.set(path, data);
+  await instance.writeFile(path, data);
+}
+
 async function ensureFfmpegFiles() {
   const instance = await loadFfmpeg();
   try {
@@ -148,6 +333,11 @@ async function ensureFfmpegFiles() {
   const font = await fetch(`${self.location.origin}/fonts/DejaVuSans-Bold.ttf`);
   if (!font.ok) throw new Error('The caption font could not be loaded.');
   await instance.writeFile(FONT_PATH, new Uint8Array(await font.arrayBuffer()));
+  // Caption ASS files are written just before a render. Restore them if a
+  // wasm trap forces the retry onto a fresh core.
+  for (const [path, data] of volatileFiles) {
+    await instance.writeFile(path, data);
+  }
   return instance;
 }
 
@@ -163,6 +353,7 @@ async function attachSource(
       throw new Error(`This source is ${(sourceFile.size / 1024 / 1024).toFixed(0)} MB; the limit is 1 GB.`);
     }
     await instance.mountSource(sourceFile, 'input.mp4');
+    sourceBlob = sourceFile;
     onProgress(1);
     return;
   }
@@ -173,26 +364,29 @@ async function attachSource(
   }
   const blob = await fetchSourceBlob(sourceUrl, sourceBytes, onProgress);
   await instance.mountSource(blob, 'input.mp4');
+  sourceBlob = blob;
 }
 
-async function probe(instance: BrowserFfmpeg) {
-  await instance.ffprobe([
-    '-v',
-    'error',
-    '-print_format',
-    'json',
-    '-show_streams',
-    '-show_format',
-    SOURCE_PATH,
-    '-o',
-    'probe.json',
-  ]);
-  const raw = await instance.readFile('probe.json', 'utf8');
-  const parsed = JSON.parse(String(raw)) as {
+async function probe(_instance: BrowserFfmpeg) {
+  await runProbe(
+    [
+      '-v',
+      'error',
+      '-print_format',
+      'json',
+      '-show_streams',
+      '-show_format',
+      SOURCE_PATH,
+      '-o',
+      'probe.json',
+    ],
+    'Source probe',
+  );
+  const parsed = (await readProbeJson('probe.json', 'Source probe')) as {
     streams?: { codec_type?: string; width?: number; height?: number; avg_frame_rate?: string; r_frame_rate?: string }[];
     format?: { duration?: string };
   };
-  await instance.deleteFile('probe.json').catch(() => undefined);
+  await (await loadFfmpeg()).deleteFile('probe.json').catch(() => undefined);
   const video = parsed.streams?.find((stream) => stream.codec_type === 'video');
   const audio = parsed.streams?.find((stream) => stream.codec_type === 'audio');
   if (!video) throw new Error('This file has no video stream.');
@@ -263,11 +457,13 @@ async function detectScenes(
     await run(
       [
         ...seek,
+        '-skip_frame',
+        'nokey',
         '-i',
         SOURCE_PATH,
         '-an',
         '-vf',
-        "select='gt(scene,0.3)',metadata=print:file=scenes.txt",
+        "scale=320:-2:flags=fast_bilinear,fps=2,select='gt(scene,0.3)',metadata=print:file=scenes.txt",
         '-fps_mode',
         'vfr',
         '-f',
@@ -276,7 +472,7 @@ async function detectScenes(
       ],
       'Scene detection',
     );
-    const text = String(await instance.readFile('scenes.txt', 'utf8'));
+    const text = String(await (await loadFfmpeg()).readFile('scenes.txt', 'utf8'));
     const offsetMs = range?.startMs ?? 0;
     const times = new Set<number>();
     for (const block of text.split(/\n(?=frame:)/)) {
@@ -290,7 +486,7 @@ async function detectScenes(
   } catch {
     return [];
   } finally {
-    await instance.deleteFile('scenes.txt').catch(() => undefined);
+    if (ffmpeg?.loaded) await ffmpeg.deleteFile('scenes.txt').catch(() => undefined);
   }
 }
 
@@ -312,6 +508,8 @@ async function analyzeClipFraming(
         (startMs / 1000).toFixed(3),
         '-t',
         (durationMs / 1000).toFixed(3),
+        '-skip_frame',
+        'nokey',
         '-i',
         SOURCE_PATH,
         '-an',
@@ -324,14 +522,18 @@ async function analyzeClipFraming(
       ],
       'Framing analysis',
     );
-    const raw = await instance.readFile(output);
+    const active = await loadFfmpeg();
+    const raw = await active.readFile(output);
     if (typeof raw === 'string' || raw.byteLength === 0) return null;
     return planFraming(splitRawFrames(new Uint8Array(raw)));
-  } catch {
-    // Framing is an enhancement. A failed sample must never fail the render.
+  } catch (error) {
+    // Framing is an enhancement. A failed sample must never fail the render,
+    // but the run wrapper has already replaced a trapped core before we get
+    // here, so the next required command is never sent to corrupt state.
+    logs.push(`Framing analysis skipped: ${(error as Error).message.slice(0, 240)}`);
     return null;
   } finally {
-    await instance.deleteFile(output).catch(() => undefined);
+    if (ffmpeg?.loaded) await ffmpeg.deleteFile(output).catch(() => undefined);
   }
 }
 
@@ -362,17 +564,115 @@ function effectsFor(plan: EditPlan, edits: ClipEdits): ClipEffects {
   };
 }
 
+interface VerifiedClip {
+  width: number;
+  height: number;
+  durationMs: number;
+  hasAudio: boolean;
+}
+
+/**
+ * Verifies the exact bytes that will be uploaded. The bytes are mounted on a
+ * fresh core so a prior render cannot leave a stale or corrupt decoder state
+ * that makes a broken file look valid. If FFprobe traps, the volatile copy is
+ * restored and the probe is retried on another fresh core.
+ */
+async function verifyRenderedClip(
+  video: Uint8Array,
+  expectedDurationMs: number,
+  clipNumber: number,
+): Promise<VerifiedClip> {
+  const reportPath = '/verify.json';
+  try {
+    const instance = await restartFfmpeg();
+    // The rendered file can be tens of megabytes. Copying it into MEMFS on top
+    // of a decoder's frame buffers exhausted the wasm heap and caused an
+    // out-of-bounds trap. Mount it through WORKERFS instead so FFprobe and the
+    // optional poster frame read the bytes on demand. This replaces the
+    // temporary source mount; the next clip starts with restartFfmpeg(), which
+    // remounts the original source.
+    await instance.mountSource(new Blob([new Uint8Array(video)], { type: 'video/mp4' }), 'verify.mp4');
+    const verifyPath = '/source/verify.mp4';
+    await runProbe(
+      [
+        '-v',
+        'error',
+        '-print_format',
+        'json',
+        '-show_streams',
+        '-show_format',
+        verifyPath,
+        '-o',
+        reportPath,
+      ],
+      `Verification of clip ${clipNumber}`,
+    );
+    const parsed = (await readProbeJson(reportPath, `Verification of clip ${clipNumber}`)) as {
+      streams?: {
+        codec_type?: string;
+        codec_name?: string;
+        width?: number;
+        height?: number;
+        duration?: string;
+      }[];
+      format?: { duration?: string; size?: string };
+    };
+    const videoStream = parsed.streams?.find((stream) => stream.codec_type === 'video');
+    const audioStream = parsed.streams?.find((stream) => stream.codec_type === 'audio');
+    const width = Number(videoStream?.width ?? 0);
+    const height = Number(videoStream?.height ?? 0);
+    const durationMs = Math.round(Number(parsed.format?.duration ?? 0) * 1000);
+    const videoDurationMs = Math.round(Number(videoStream?.duration ?? 0) * 1000);
+    if (videoStream?.codec_name !== 'h264') {
+      throw new Error(`Clip ${clipNumber} did not contain an H.264 video stream.`);
+    }
+    if (width !== 1080 || height !== 1920) {
+      throw new Error(`Clip ${clipNumber} was ${width}×${height}, not 1080×1920.`);
+    }
+    if (!audioStream) {
+      throw new Error(`Clip ${clipNumber} had no audio stream.`);
+    }
+    if (!Number.isFinite(durationMs) || Math.abs(durationMs - expectedDurationMs) > 1_500) {
+      throw new Error(
+        `Clip ${clipNumber} duration was ${durationMs}ms; expected ${expectedDurationMs}ms.`,
+      );
+    }
+    if (!Number.isFinite(videoDurationMs) || Math.abs(videoDurationMs - expectedDurationMs) > 1_000) {
+      throw new Error(
+        `Clip ${clipNumber} video track was ${videoDurationMs}ms; expected ${expectedDurationMs}ms. Facts and audio may be longer, but this MP4 would go black before the clip ends.`,
+      );
+    }
+    return { width, height, durationMs, hasAudio: true };
+  } finally {
+    if (ffmpeg?.loaded) {
+      await ffmpeg.deleteFile(reportPath).catch(() => undefined);
+    }
+  }
+}
+
+/**
+ * Poster capture is required. The exact rendered bytes are sent to the page,
+ * which decodes them with an HTMLVideoElement and captures a canvas JPEG. A
+ * failure throws, so a clip cannot be finalized without a poster.
+ */
+async function generatePoster(video: Uint8Array, clipNumber: number): Promise<Uint8Array> {
+  mark(`clip-${clipNumber}-poster-start`);
+  const poster = await requestPosterFromMainThread(video, clipNumber);
+  mark(`clip-${clipNumber}-poster`);
+  return poster;
+}
+
 async function renderClip(plan: EditPlan, width: number, height: number, clipNumber: number, progress: (fraction: number) => void) {
   const instance = await loadFfmpeg();
   const output = `clip-${String(clipNumber).padStart(2, '0')}.mp4`;
-  const captionFile = `captions-${clipNumber}.ass`;
+  const captionFile = `/captions-${clipNumber}.ass`;
   const captions = buildAssCaptions(plan.captionWords, {
     startMs: 0,
     endMs: plan.outputDurationMs,
     highlightKeywords: true,
   });
   const hasCaptions = captions.cueCount > 0;
-  if (hasCaptions) await instance.writeFile(captionFile, captions.ass);
+  if (hasCaptions) await writeVolatileFile(instance, captionFile, captions.ass);
 
   const args = buildClipRenderArgs({
     plan,
@@ -380,31 +680,43 @@ async function renderClip(plan: EditPlan, width: number, height: number, clipNum
     sourceHeight: height,
     source: SOURCE_PATH,
     output,
-    captionFile: hasCaptions ? `/${captionFile}` : null,
+    captionFile: hasCaptions ? captionFile : null,
   });
 
   activeProgress = progress;
   try {
     await run(args, `Render of clip ${clipNumber}`);
-    const raw = await instance.readFile(output);
+    mark(`clip-${clipNumber}-encoded`);
+    const rendered = await loadFfmpeg();
+    const raw = await rendered.readFile(output);
     if (typeof raw === 'string' || raw.byteLength < 1024) throw new Error('The browser renderer produced an empty clip.');
     const video = new Uint8Array(raw);
+    mark(`clip-${clipNumber}-output-read`);
 
-    await run(['-ss', '1', '-i', output, '-frames:v', '1', '-q:v', '4', '-y', `poster-${clipNumber}.jpg`], 'Poster render');
-    const posterRaw = await instance.readFile(`poster-${clipNumber}.jpg`);
-    const poster = typeof posterRaw === 'string' ? null : new Uint8Array(posterRaw);
+    progress(0.97);
+    const verified = await verifyRenderedClip(video, plan.outputDurationMs, clipNumber);
+    mark(`clip-${clipNumber}-verified`);
+    const poster = await generatePoster(video, clipNumber);
+    progress(1);
 
-    await instance.deleteFile(output);
-    await instance.deleteFile(`poster-${clipNumber}.jpg`).catch(() => undefined);
-    await instance.deleteFile(captionFile).catch(() => undefined);
-
-    return { video, poster, hasCaptions, captionCount: captions.cueCount };
+    return {
+      video,
+      poster,
+      hasCaptions,
+      captionCount: captions.cueCount,
+      verified,
+    };
   } finally {
     activeProgress = null;
+    volatileFiles.delete(captionFile);
+    if (ffmpeg?.loaded) {
+      await ffmpeg.deleteFile(output).catch(() => undefined);
+      await ffmpeg.deleteFile(captionFile).catch(() => undefined);
+    }
   }
 }
 
-async function uploadClip(projectId: string, clipId: string, index: number, video: Uint8Array, poster: Uint8Array | null, meta: {
+async function uploadClip(projectId: string, clipId: string, index: number, video: Uint8Array, poster: Uint8Array, meta: {
   width: number;
   height: number;
   durationMs: number;
@@ -413,6 +725,7 @@ async function uploadClip(projectId: string, clipId: string, index: number, vide
   edits: ClipEdits;
   effects: ClipEffects;
 }) {
+  mark(`clip-${index + 1}-video-upload-start`);
   const videoResponse = await fetch(`/api/clips/${clipId}/upload?asset=video`, {
     method: 'PUT',
     credentials: 'same-origin',
@@ -423,18 +736,18 @@ async function uploadClip(projectId: string, clipId: string, index: number, vide
     const data = (await videoResponse.json().catch(() => ({}))) as { error?: string };
     throw new Error(data.error ?? `Clip upload failed (HTTP ${videoResponse.status}).`);
   }
-  if (poster) {
-    const posterResponse = await fetch(`/api/clips/${clipId}/upload?asset=poster`, {
-      method: 'PUT',
-      credentials: 'same-origin',
-      headers: { 'content-type': 'image/jpeg', 'x-file-size': String(poster.byteLength) },
-      body: poster as BodyInit,
-    });
-    if (!posterResponse.ok) {
-      const data = (await posterResponse.json().catch(() => ({}))) as { error?: string };
-      throw new Error(data.error ?? `Poster upload failed (HTTP ${posterResponse.status}).`);
-    }
+  mark(`clip-${index + 1}-video-uploaded`);
+  const posterResponse = await fetch(`/api/clips/${clipId}/upload?asset=poster`, {
+    method: 'PUT',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'image/jpeg', 'x-file-size': String(poster.byteLength) },
+    body: poster as BodyInit,
+  });
+  const posterData = (await posterResponse.json().catch(() => ({}))) as { error?: string; key?: string };
+  if (!posterResponse.ok) {
+    throw new Error(posterData.error ?? `Poster upload failed (HTTP ${posterResponse.status}).`);
   }
+  mark(`clip-${index + 1}-poster-uploaded`);
   const finalized = await fetch(`/api/clips/${clipId}/finalize`, {
     method: 'POST',
     credentials: 'same-origin',
@@ -442,8 +755,9 @@ async function uploadClip(projectId: string, clipId: string, index: number, vide
     body: JSON.stringify({
       ...meta,
       bytes: video.byteLength,
-      posterBytes: poster?.byteLength ?? null,
-      hasPoster: Boolean(poster),
+      posterBytes: poster.byteLength,
+      hasPoster: true,
+      posterKey: posterData.key ?? null,
       index,
     }),
   });
@@ -451,15 +765,16 @@ async function uploadClip(projectId: string, clipId: string, index: number, vide
   if (!finalized.ok || !data.clip) {
     throw new Error(data.error ?? `Could not save the rendered clip (HTTP ${finalized.status}).`);
   }
+  mark(`clip-${index + 1}-finalized`);
   return data.clip;
 }
 
 async function finishClip(projectId: string, clip: { id: string; index: number }, edits: ClipEdits, plan: EditPlan, rendered: Awaited<ReturnType<typeof renderClip>>) {
   const effects = effectsFor(plan, edits);
   return uploadClip(projectId, clip.id, clip.index, rendered.video, rendered.poster, {
-    width: 1080,
-    height: 1920,
-    durationMs: plan.outputDurationMs,
+    width: rendered.verified.width,
+    height: rendered.verified.height,
+    durationMs: rendered.verified.durationMs,
     captionMode: rendered.hasCaptions ? `burned-in (${rendered.captionCount} cues)` : 'none',
     cropStrategy: buildVerticalFilter(
       { width: session?.width ?? 1080, height: session?.height ?? 1920 },
@@ -522,6 +837,7 @@ async function analyzeAudioSegments(
         ? `Measuring audio section ${index + 1} of ${segmentCount}`
         : `Transcribing audio section ${index + 1} of ${segmentCount}`,
     );
+    const extractStartedAt = performance.now();
     let audio: DecodedAudio | null = await retrySection(
       () => extractAudioSegment(instance, segmentStart, segmentEnd),
       {
@@ -533,6 +849,9 @@ async function analyzeAudioSegments(
           ),
       },
     );
+    console.info(
+      `[ac-timing] audio-section-${index + 1} extract ${Math.round(performance.now() - extractStartedAt)}ms`,
+    );
     const chunkSignals = signalsFromSamples(audio, [], segmentStart);
     levels.push(...chunkSignals.audio);
     peaks.push(...chunkSignals.peaksMs);
@@ -540,6 +859,7 @@ async function analyzeAudioSegments(
     if (activeTranscriber) {
       const active = activeTranscriber;
       const sectionAudio = audio;
+      const transcribeStartedAt = performance.now();
       const part = await retrySection(
         () =>
           active.transcribe(
@@ -560,6 +880,9 @@ async function analyzeAudioSegments(
               `Transcription section ${index + 1} failed (${error.message.slice(0, 120)}); retrying once`,
             ),
         },
+      );
+      console.info(
+        `[ac-timing] audio-section-${index + 1} transcribe ${Math.round(performance.now() - transcribeStartedAt)}ms`,
       );
       const skipBefore = index === 0 ? -1 : segmentStart + AUDIO_SEGMENT_OVERLAP_MS - 30;
       for (const word of part.words) {
@@ -609,19 +932,33 @@ async function analyzeAudioSegments(
   };
 }
 
+const EMPTY_SIGNALS: BrowserSignals = {
+  audio: [],
+  peaksMs: [],
+  sceneChangesMs: [],
+  source: { audio: false, visual: false },
+};
+
 async function runStart(message: StartMessage) {
   cancelled = false;
   const projectId = message.projectId;
+  lastProgress = 0;
+  runStartedAt = performance.now();
+  markAt = runStartedAt;
+  currentClipNumber = null;
   let currentStage: PipelineStage = 'probe';
   try {
-    send({ type: 'progress', stage: 'probe', progress: 1, detail: 'Preparing browser processor' });
-    const data = (await (await fetch(`/api/projects/${projectId}/processor`, { credentials: 'same-origin' })).json()) as {
+    await report(projectId, 'probe', 0.02, 'Preparing browser processor');
+    const response = await fetch(`/api/projects/${projectId}/processor`, { credentials: 'same-origin' });
+    const data = (await response.json().catch(() => ({}))) as {
       sourceMode?: 'local' | 'remote' | 'none';
       sourceUrl: string | null;
       sourceBytes: number | null;
       transcript?: import('./protocol').BrowserTranscript | null;
+      clips?: ProcessorClip[];
       error?: string;
     };
+    if (!response.ok) throw new Error(data.error ?? `Could not load the project (HTTP ${response.status}).`);
     if (data.sourceMode === 'local' && !message.sourceFile) {
       throw new Error(
         'This source is kept in your browser. Attach the original video on this device before processing.',
@@ -633,102 +970,173 @@ async function runStart(message: StartMessage) {
     await report(
       projectId,
       'probe',
-      2,
+      0.05,
       message.sourceFile ? 'Opening the local source in this tab' : 'Downloading the source into this tab',
     );
     const instance = await ensureFfmpegFiles();
     await attachSource(instance, message.sourceFile, data.sourceUrl, data.sourceBytes, (fraction) =>
-      void report(projectId, 'probe', 2 + fraction * 8, `Preparing source ${Math.round(fraction * 100)}%`),
+      void report(projectId, 'probe', 0.05 + fraction * 0.1, `Preparing source ${Math.round(fraction * 100)}%`),
     );
-    await report(projectId, 'probe', 15, 'Reading video metadata');
+    mark('source-mounted');
+    await report(projectId, 'probe', 0.2, 'Reading video metadata');
     const meta = await probe(instance);
     if (!meta.hasAudio) {
       throw new Error('This video has no audio track. AutoClipper needs speech to transcribe and find highlights.');
     }
     send({ type: 'meta', ...meta });
-    await report(projectId, 'probe', 100, `${meta.width}×${meta.height}, ${Math.round(meta.durationMs / 1000)}s`);
+    await report(projectId, 'probe', 1, `${meta.width}×${meta.height}, ${Math.round(meta.durationMs / 1000)}s`);
+    mark('source-probed');
 
-    currentStage = 'audio';
-    await report(projectId, 'audio', 1, 'Measuring and transcribing audio in bounded sections');
-    const analysis = await analyzeAudioSegments(
-      instance,
-      meta,
-      data.transcript,
-      message.engine,
-      (fraction, detail) => void report(projectId, 'transcribe', Math.max(1, fraction * 100), detail),
-      (detail, fraction) => {
-        send({ type: 'model', detail, progress: Math.round(fraction * 100) });
-        void report(projectId, 'transcribe', 1 + fraction * 24, detail);
-      },
-      (engine, detail) => send({ type: 'engine', engine, detail }),
+    const existingClips = Array.isArray(data.clips)
+      ? data.clips.filter((clip) => clip && Number.isFinite(clip.startMs) && Number.isFinite(clip.endMs))
+      : [];
+    const reusableTranscript = Boolean(
+      data.transcript && Array.isArray(data.transcript.words) && data.transcript.words.length > 0,
     );
-    currentStage = 'transcribe';
-    const signals = analysis.signals;
-    const transcript = analysis.transcript;
-    send({ type: 'transcript', wordCount: transcript.words.length, language: transcript.language });
-    await report(projectId, 'transcribe', 100, `${transcript.words.length} words ready`);
-    session = hydrateSession(projectId, meta, signals, transcript);
-    await post(`/api/projects/${projectId}/process`, {
-      action: 'transcript',
-      transcript,
-      meta,
-      signals,
-    });
+    let transcript: import('./protocol').BrowserTranscript;
+    let signals: BrowserSignals;
+    let savedClips: ProcessorClip[];
 
-    currentStage = 'select';
-    await report(projectId, 'select', 10, 'Scoring hooks, context, payoff, substance, pacing and energy');
-    const rawSelected = selectHighlightsHeuristically({
-      words: transcript.words,
-      segments: transcript.segments,
-      durationMs: meta.durationMs,
-      targetCount: TARGET_CLIP_COUNT,
-      signals: signals as never,
-    });
-    const selected = finalizeSelection(rawSelected, {
-      durationMs: meta.durationMs,
-      targetCount: TARGET_CLIP_COUNT,
-    });
-    if (selected.length === 0) {
-      throw new Error('No highlight was long enough to make a clip. The source needs at least a few continuous seconds of speech.');
+    if (reusableTranscript) {
+      // A retry must not re-extract 27 minutes of audio just to recreate the
+      // signals. The saved transcript and the existing clip selection are the
+      // durable state; resume directly at the first unfinished clip.
+      transcript = data.transcript as import('./protocol').BrowserTranscript;
+      signals = EMPTY_SIGNALS;
+      savedClips = existingClips;
+      send({ type: 'transcript', wordCount: transcript.words.length, language: transcript.language });
+      await report(
+        projectId,
+        'transcribe',
+        1,
+        `Saved transcript reused (${transcript.words.length} words); no audio re-analysis needed`,
+      );
+      mark('transcript-reused');
+    } else {
+      currentStage = 'transcribe';
+      await report(projectId, 'audio', 1, 'Transcribing audio in bounded sections');
+      const analysis = await analyzeAudioSegments(
+        instance,
+        meta,
+        null,
+        message.engine,
+        (fraction, detail) => void report(projectId, 'transcribe', fraction, detail),
+        (detail, fraction) => {
+          send({ type: 'model', detail, progress: Math.round(fraction * 100) });
+          void report(projectId, 'transcribe', fraction * 0.05, detail);
+        },
+        (engine, detail) => send({ type: 'engine', engine, detail }),
+      );
+      transcript = analysis.transcript;
+      signals = analysis.signals;
+      savedClips = [];
+      send({ type: 'transcript', wordCount: transcript.words.length, language: transcript.language });
+      await report(projectId, 'transcribe', 1, `${transcript.words.length} words ready`);
+      mark('transcribed');
+      session = hydrateSession(projectId, meta, signals, transcript);
+      await post(`/api/projects/${projectId}/process`, {
+        action: 'transcript',
+        transcript,
+        meta,
+        signals,
+      });
     }
-    const selectionData = (await post(`/api/projects/${projectId}/process`, {
-      action: 'selection',
-      clips: selected,
-      selectionEngine: 'browser-multi-signal-heuristic',
-    })) as { clips?: { id: string; index: number; startMs: number; endMs: number; title: string }[] };
-    const savedClips = selectionData.clips ?? [];
-    if (savedClips.length === 0) throw new Error('The server did not save the selected clips.');
-    send({ type: 'selection', count: savedClips.length });
-    await report(projectId, 'select', 100, `${savedClips.length} highlights selected`);
 
+    if (!reusableTranscript || savedClips.length === 0) {
+      currentStage = 'select';
+      const selectionStartedAt = performance.now();
+      await report(
+        projectId,
+        'select',
+        0.1,
+        'Scoring hooks, engagement, clarity, context, payoff, substance and pacing; ranking strongest first',
+      );
+      const rawSelected = selectHighlightsHeuristically({
+        words: transcript.words,
+        segments: transcript.segments,
+        durationMs: meta.durationMs,
+        targetCount: TARGET_CLIP_COUNT,
+        signals: signals as never,
+      });
+      const selected = finalizeSelection(rawSelected, {
+        durationMs: meta.durationMs,
+        targetCount: TARGET_CLIP_COUNT,
+      });
+      if (selected.length === 0) {
+        throw new Error('No highlight was long enough to make a clip. The source needs at least a few continuous seconds of speech.');
+      }
+      const selectionData = (await post(`/api/projects/${projectId}/process`, {
+        action: 'selection',
+        clips: selected,
+        selectionEngine: 'browser-multi-signal-heuristic',
+      })) as { clips?: ProcessorClip[] };
+      savedClips = selectionData.clips ?? [];
+      if (savedClips.length === 0) throw new Error('The server did not save the selected clips.');
+      console.info(
+        `[ac-timing] selection ${Math.round(performance.now() - selectionStartedAt)}ms`,
+      );
+      await report(projectId, 'select', 1, `${savedClips.length} highlights selected`);
+      mark('selection-ready');
+    } else {
+      await report(
+        projectId,
+        'select',
+        1,
+        `${savedClips.filter((clip) => clip.status === 'rendered').length} of ${savedClips.length} clips already rendered`,
+      );
+    }
+
+    send({ type: 'selection', count: savedClips.length });
+    session = hydrateSession(projectId, meta, signals, transcript);
     currentStage = 'render';
-    for (let index = 0; index < savedClips.length; index += 1) {
+
+    const total = savedClips.length;
+    let renderedCount = savedClips.filter((clip) => clip.status === 'rendered').length;
+    for (let index = 0; index < total; index += 1) {
       if (cancelled) throw new Error('Processing was cancelled.');
       const saved = savedClips[index];
-      const sourceClip = selected[index] ?? selected[0];
+      if (saved.status === 'rendered') continue;
+      currentClipNumber = saved.index + 1;
+
+      // Start every clip from a clean wasm core. A 27-minute source exercises
+      // enough decoder/filter state that a single long-lived core can trap
+      // midway; the extra reload costs seconds and makes the remaining clips
+      // independent of earlier ones.
+      await restartFfmpeg();
+      mark(`clip-${currentClipNumber}-core-ready`);
+
       const edits: ClipEdits = {
         ...DEFAULT_EDITS,
+        ...(saved.edits ?? {}),
         startMs: saved.startMs,
         endMs: saved.endMs,
       };
-      const clipSignals = signals.sceneChangesMs.length > 0
-        ? signals
-        : {
-            ...signals,
-            sceneChangesMs: await detectScenes(instance, { startMs: saved.startMs, endMs: saved.endMs }),
-          };
+      let clipSignals = signals;
+      if (edits.slowMotionEnabled) {
+        clipSignals = {
+          ...signals,
+          sceneChangesMs: await detectScenes(await loadFfmpeg(), {
+            startMs: saved.startMs,
+            endMs: saved.endMs,
+          }),
+        };
+      }
       await report(
         projectId,
         'render',
-        (index / savedClips.length) * 100,
-        `Framing clip ${index + 1} of ${savedClips.length}`,
+        index / total,
+        `Framing clip ${index + 1} of ${total}`,
       );
+      const framingStartedAt = performance.now();
       const framing = await analyzeClipFraming(
-        instance,
+        await loadFfmpeg(),
         meta.width,
         meta.height,
         saved.startMs,
         saved.endMs,
+      );
+      console.info(
+        `[ac-timing] clip-${currentClipNumber}-framing ${Math.round(performance.now() - framingStartedAt)}ms`,
       );
       const plan = buildEditPlan({
         words: transcript.words,
@@ -741,33 +1149,62 @@ async function runStart(message: StartMessage) {
       await report(
         projectId,
         'render',
-        (index / savedClips.length) * 100,
-        `Rendering clip ${index + 1} of ${savedClips.length}`,
+        index / total,
+        `Rendering clip ${index + 1} of ${total}`,
       );
-      const rendered = await renderClip(plan, meta.width, meta.height, index + 1, (fraction) => {
-        const overall = ((index + fraction) / savedClips.length) * 100;
-        void report(projectId, 'render', overall, `Encoding clip ${index + 1} of ${savedClips.length} · ${Math.round(fraction * 100)}%`);
+      const rendered = await renderClip(plan, meta.width, meta.height, currentClipNumber, (fraction) => {
+        const encoded = Math.min(1, Math.max(0, Number.isFinite(fraction) ? fraction : 0)) * 0.9;
+        void report(
+          projectId,
+          'render',
+          (index + encoded) / total,
+          `Encoding clip ${index + 1} of ${total} · ${Math.round(fraction * 100)}%`,
+        );
       });
       const clip = await finishClip(projectId, saved, edits, plan, rendered);
+      renderedCount += 1;
       send({ type: 'clip', clip });
-      void sourceClip;
+      await report(
+        projectId,
+        'render',
+        (index + 1) / total,
+        `Clip ${index + 1} of ${total} stored and verified`,
+      );
+      mark(`clip-${currentClipNumber}-uploaded`);
     }
-    await report(projectId, 'render', 100, 'All clips rendered');
-    const completed = (await post(`/api/projects/${projectId}/process`, { action: 'complete' })) as { project?: import('../types').Project };
+
+    if (renderedCount !== total) {
+      throw new Error(
+        `Only ${renderedCount} of ${total} selected clips have stored rendered files. The project was not marked complete.`,
+      );
+    }
+    await report(projectId, 'render', 1, `All ${total} clips rendered and verified`);
+    const completed = (await post(`/api/projects/${projectId}/process`, { action: 'complete' })) as {
+      project?: import('../types').Project;
+    };
     send({ type: 'done', project: completed.project as import('../types').Project });
+    mark('complete');
   } catch (error) {
     const failureStage = error instanceof ModelLoadError ? 'transcribe' : currentStage;
+    const elapsed = ((performance.now() - runStartedAt) / 1000).toFixed(1);
+    const clip = currentClipNumber ? ` clip ${currentClipNumber}` : '';
+    const generation = ffmpeg?.generation ?? 'none';
+    const memory = ffmpeg ? ` memory=${Math.round(ffmpeg.memoryBytes / 1024 / 1024)}MB` : '';
+    const message = `${(error as Error).message || String(error)} [stage=${failureStage}${clip}; elapsed=${elapsed}s; ffmpeg=${generation}${memory}]`.slice(
+      0,
+      1500,
+    );
     try {
       await post(`/api/projects/${projectId}/process`, {
         action: 'fail',
-        error: (error as Error).message.slice(0, 1500),
+        error: message,
         stage: failureStage,
       });
     } catch {
       // If the failure report itself cannot be stored, the error is still sent
       // to the open tab so the user is not left with a silent failure.
     }
-    fail(error);
+    fail(new Error(message), 'Browser processing failed.');
   }
 }
 
@@ -776,13 +1213,15 @@ async function ensureSession(
   sourceFile: File | null | undefined,
 ): Promise<Session> {
   if (session?.projectId === projectId) return session;
-  const data = (await (await fetch(`/api/projects/${projectId}/processor`, { credentials: 'same-origin' })).json()) as {
+  const response = await fetch(`/api/projects/${projectId}/processor`, { credentials: 'same-origin' });
+  const data = (await response.json().catch(() => ({}))) as {
     sourceMode?: 'local' | 'remote' | 'none';
     sourceUrl: string | null;
     sourceBytes: number | null;
     transcript?: import('./protocol').BrowserTranscript | null;
     error?: string;
   };
+  if (!response.ok) throw new Error(data.error ?? `Could not load the project (HTTP ${response.status}).`);
   if (data.sourceMode === 'local' && !sourceFile) {
     throw new Error('This source is kept in your browser. Attach the original video to render a clip.');
   }
@@ -791,16 +1230,23 @@ async function ensureSession(
   await attachSource(instance, sourceFile, data.sourceUrl, data.sourceBytes, () => undefined);
   const meta = await probe(instance);
   if (!meta.hasAudio) throw new Error('This video has no audio track.');
+  if (data.transcript && Array.isArray(data.transcript.words) && data.transcript.words.length > 0) {
+    // Editing or regenerating one clip must not re-extract the whole source.
+    // The saved transcript is enough to rebuild captions/framing; scene data
+    // is computed only when the user explicitly requests slow motion.
+    session = hydrateSession(projectId, meta, EMPTY_SIGNALS, data.transcript);
+    return session;
+  }
   const analysis = await analyzeAudioSegments(
     instance,
     meta,
-    data.transcript,
+    null,
     'auto',
     () => undefined,
     () => undefined,
     () => undefined,
   );
-  session = hydrateSession(projectId, meta, analysis.signals, data.transcript ?? analysis.transcript);
+  session = hydrateSession(projectId, meta, analysis.signals, analysis.transcript);
   return session;
 }
 
@@ -810,13 +1256,14 @@ async function runRenderClip(message: RenderClipMessage) {
     if (!active.transcript) throw new Error('The transcript for this project is missing. Re-run processing first.');
     const edits = { ...DEFAULT_EDITS, ...message.edits, startMs: message.startMs, endMs: message.endMs };
     let signals = active.signals;
-    if (signals && signals.sceneChangesMs.length === 0) {
+    if (edits.slowMotionEnabled && signals) {
       const instance = await loadFfmpeg();
       signals = {
         ...signals,
         sceneChangesMs: await detectScenes(instance, { startMs: message.startMs, endMs: message.endMs }),
       };
     }
+    await restartFfmpeg();
     const framing = await analyzeClipFraming(
       await loadFfmpeg(),
       active.width,
@@ -842,13 +1289,19 @@ async function runRenderClip(message: RenderClipMessage) {
     );
     send({ type: 'render-done', clip });
   } catch (error) {
-    fail(error);
+    fail(
+      new Error(
+        `${(error as Error).message} [stage=re-render; clip ${message.index + 1}; ffmpeg=${ffmpeg?.generation ?? 'none'}]`,
+      ),
+    );
   }
 }
 
 self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const message = event.data;
-  if (message.type === 'start') {
+  if (message.type === 'poster-response') {
+    resolvePosterResponse(message);
+  } else if (message.type === 'start') {
     void runStart(message);
   } else if (message.type === 'render-clip') {
     void runRenderClip(message);

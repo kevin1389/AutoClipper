@@ -1,8 +1,8 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { formatBytes, formatDuration } from '@/lib/format';
-import type { ClipEdits, ClipView } from '@/lib/types';
+import type { ClipEdits, ClipScoreBreakdown, ClipView } from '@/lib/types';
 
 interface ClipCardProps {
   clip: ClipView;
@@ -11,10 +11,29 @@ interface ClipCardProps {
   onRerender?: (clip: ClipView, edits: ClipEdits) => Promise<ClipView>;
 }
 
-const SCORE_FIELDS = ['hook', 'entertainment', 'substance', 'context', 'payoff', 'pacing'] as const;
+const SCORE_FIELDS = [
+  { key: 'hook', label: 'Hook' },
+  { key: 'engagement', label: 'Engagement' },
+  { key: 'clarity', label: 'Clarity' },
+  { key: 'substance', label: 'Substance' },
+  { key: 'context', label: 'Context' },
+  { key: 'payoff', label: 'Payoff' },
+  { key: 'pacing', label: 'Pacing' },
+] as const;
+
+type ScoreFieldKey = (typeof SCORE_FIELDS)[number]['key'];
 
 function seconds(ms: number): string {
   return (ms / 1000).toFixed(1);
+}
+
+function scoreValue(breakdown: ClipScoreBreakdown | null | undefined, key: ScoreFieldKey): number {
+  if (!breakdown) return 0;
+  // Older persisted clips used "entertainment"; keep them readable after the
+  // score was renamed to engagement.
+  if (key === 'engagement') return breakdown.engagement ?? breakdown.entertainment ?? 0;
+  const value = breakdown[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 export function ClipCard({ clip, onUpdated, onRerender }: ClipCardProps) {
@@ -28,8 +47,36 @@ export function ClipCard({ clip, onUpdated, onRerender }: ClipCardProps) {
   const [captionText, setCaptionText] = useState(clip.edits?.captionText ?? '');
   const [zoomEnabled, setZoomEnabled] = useState(clip.edits?.zoomEnabled ?? true);
   const [zoomIntensity, setZoomIntensity] = useState(clip.edits?.zoomIntensity ?? 1);
-  const [slowMotionEnabled, setSlowMotionEnabled] = useState(clip.edits?.slowMotionEnabled ?? true);
+  const [slowMotionEnabled, setSlowMotionEnabled] = useState(clip.edits?.slowMotionEnabled ?? false);
   const [revision, setRevision] = useState(0);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [preloadVideo, setPreloadVideo] = useState(false);
+  const ready = clip.status === 'rendered';
+
+  // Loading every clip's metadata at once saturates the provider connection
+  // pool, so the first clip can take minutes to start. Start a clip's request
+  // only when its card is near the viewport.
+  useEffect(() => {
+    setPreloadVideo(false);
+    if (!ready) return;
+    const video = videoRef.current;
+    if (!video) return;
+    if (typeof IntersectionObserver === 'undefined') {
+      setPreloadVideo(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setPreloadVideo(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '240px' },
+    );
+    observer.observe(video);
+    return () => observer.disconnect();
+  }, [clip.id, ready, revision]);
 
   useEffect(() => {
     setStartSec(seconds(clip.edits?.startMs ?? clip.startMs));
@@ -37,10 +84,9 @@ export function ClipCard({ clip, onUpdated, onRerender }: ClipCardProps) {
     setCaptionText(clip.edits?.captionText ?? '');
     setZoomEnabled(clip.edits?.zoomEnabled ?? true);
     setZoomIntensity(clip.edits?.zoomIntensity ?? 1);
-    setSlowMotionEnabled(clip.edits?.slowMotionEnabled ?? true);
+    setSlowMotionEnabled(clip.edits?.slowMotionEnabled ?? false);
   }, [clip.id, clip.edits, clip.startMs, clip.endMs]);
 
-  const ready = clip.status === 'rendered';
   const zoomCount = clip.effects?.zoomWindows.length ?? 0;
   const slowCount = clip.effects?.slowMotion.length ?? 0;
   const removedSeconds = clip.effects ? clip.effects.removedPausesMs / 1000 : 0;
@@ -109,10 +155,11 @@ export function ClipCard({ clip, onUpdated, onRerender }: ClipCardProps) {
         {ready ? (
           <video
             key={`${clip.id}-${revision}-${clip.bytes ?? 0}`}
+            ref={videoRef}
             className="h-full w-full object-cover"
             controls
             playsInline
-            preload="metadata"
+            preload={preloadVideo ? 'metadata' : 'none'}
             poster={clip.posterUrl ?? undefined}
           >
             <source src={clip.videoUrl} type="video/mp4" />
@@ -129,7 +176,10 @@ export function ClipCard({ clip, onUpdated, onRerender }: ClipCardProps) {
         )}
 
         <div className="pointer-events-none absolute left-2.5 top-2.5 flex items-center gap-1.5">
-          <span className="rounded-md bg-black/70 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-white/90 backdrop-blur">
+          <span
+            className="rounded-md bg-black/70 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-white/90 backdrop-blur"
+            title="Estimated rank by potential"
+          >
             {String(clip.index + 1).padStart(2, '0')}
           </span>
           {ready && clip.captionMode && clip.captionMode !== 'none' && (
@@ -138,7 +188,10 @@ export function ClipCard({ clip, onUpdated, onRerender }: ClipCardProps) {
             </span>
           )}
           {clip.scoreBreakdown ? (
-            <span className="rounded-md bg-black/70 px-1.5 py-0.5 font-mono text-[10px] font-medium text-white/80 backdrop-blur">
+            <span
+              className="rounded-md bg-black/70 px-1.5 py-0.5 font-mono text-[10px] font-medium text-white/80 backdrop-blur"
+              title="Estimated potential — not a guarantee of views"
+            >
               {(clip.scoreBreakdown.total * 100).toFixed(0)}
             </span>
           ) : null}
@@ -164,18 +217,29 @@ export function ClipCard({ clip, onUpdated, onRerender }: ClipCardProps) {
         </div>
 
         {clip.scoreBreakdown && (
-          <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
-            {SCORE_FIELDS.map((field) => (
-              <div key={field} className="flex items-center gap-1.5">
-                <span className="w-[74px] shrink-0 text-[10px] capitalize text-mist-500">{field}</span>
-                <span className="h-1 flex-1 overflow-hidden rounded-full bg-ink-700">
-                  <span
-                    className="block h-full rounded-full bg-white/70"
-                    style={{ width: `${Math.round((clip.scoreBreakdown?.[field] ?? 0) * 100)}%` }}
-                  />
-                </span>
-              </div>
-            ))}
+          <div className="space-y-2">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="text-[10px] uppercase tracking-wide text-mist-500">Estimated potential</span>
+              <span className="font-mono text-[11px] text-mist-300">
+                {(clip.scoreBreakdown.total * 100).toFixed(0)}/100
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
+              {SCORE_FIELDS.map((field) => (
+                <div key={field.key} className="flex items-center gap-1.5">
+                  <span className="w-[74px] shrink-0 text-[10px] text-mist-500">{field.label}</span>
+                  <span className="h-1 flex-1 overflow-hidden rounded-full bg-ink-700">
+                    <span
+                      className="block h-full rounded-full bg-white/70"
+                      style={{ width: `${Math.round(scoreValue(clip.scoreBreakdown, field.key) * 100)}%` }}
+                    />
+                  </span>
+                </div>
+              ))}
+            </div>
+            <p className="text-[10px] leading-relaxed text-mist-500">
+              Estimated potential ranks moments for review. It is not a guarantee of views.
+            </p>
           </div>
         )}
 
@@ -298,7 +362,7 @@ export function ClipCard({ clip, onUpdated, onRerender }: ClipCardProps) {
                 onChange={(event) => setSlowMotionEnabled(event.target.checked)}
                 className="h-3.5 w-3.5 accent-white"
               />
-              Slow motion on payoff moments
+              Slow motion (optional)
             </label>
 
             <p className="text-[10px] leading-relaxed text-mist-500">

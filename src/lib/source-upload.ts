@@ -51,13 +51,26 @@ export interface StartedSourceUpload {
   providerId?: string;
 }
 
+/**
+ * Local staging ids are server-generated UUIDs. Rejecting anything else keeps
+ * a caller-supplied session id from escaping the uploads directory through
+ * path traversal ("..") or an absolute path, which the cleanup and abort
+ * paths would otherwise turn into a recursive delete or write outside it.
+ */
+const LOCAL_UPLOAD_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function uploadTempDir(uploadId: string): string {
+  if (!LOCAL_UPLOAD_ID_RE.test(uploadId)) throw new Error('Invalid upload session id.');
   return path.join(config().dataDir, 'uploads', uploadId);
 }
 
 async function localMeta(uploadId: string): Promise<{ projectId: string; destination: string } | null> {
+  // Validate before the try block: a swallowed traversal error would turn a
+  // rejected session id into a generic "not found" and hide the guard.
+  const dir = uploadTempDir(uploadId);
   try {
-    return JSON.parse(await fsp.readFile(path.join(uploadTempDir(uploadId), 'meta.json'), 'utf8')) as {
+    return JSON.parse(await fsp.readFile(path.join(dir, 'meta.json'), 'utf8')) as {
       projectId: string;
       destination: string;
     };

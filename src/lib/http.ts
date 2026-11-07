@@ -42,7 +42,16 @@ export async function fileResponse(
 ): Promise<Response> {
   let size: number;
   if (isRemoteObjectPath(filePath)) {
-    const remoteSize = await fileSize(filePath);
+    let remoteSize: number | null;
+    try {
+      remoteSize = await fileSize(filePath);
+    } catch {
+      return jsonError(
+        503,
+        'storage_unavailable',
+        'The storage provider could not be read. This is not a missing file; retry when storage is available.',
+      );
+    }
     if (remoteSize === null || remoteSize === 0) {
       return jsonError(404, 'file_not_found', 'That file is no longer available.');
     }
@@ -84,10 +93,19 @@ export async function fileResponse(
   }
 
   if (isRemoteObjectPath(filePath)) {
-    const object = await getBlob(
-      filePath,
-      range ? { offset: range.start, length: range.end - range.start + 1 } : undefined,
-    );
+    let object: Awaited<ReturnType<typeof getBlob>>;
+    try {
+      object = await getBlob(
+        filePath,
+        range ? { offset: range.start, length: range.end - range.start + 1 } : undefined,
+      );
+    } catch {
+      return jsonError(
+        503,
+        'storage_unavailable',
+        'The storage provider could not be read. This is not a missing file; retry when storage is available.',
+      );
+    }
     if (!object) return jsonError(404, 'file_not_found', 'That file is no longer available.');
     return new Response(object.body, {
       status: range ? 206 : 200,

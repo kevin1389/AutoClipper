@@ -53,12 +53,14 @@ export function buildClipRenderArgs(input: ClipRenderInput): string[] {
   });
 
   filters.push(`${concatInputs.join('')}concat=n=${pieces.length}:v=1:a=1[vcat][acat]`);
-  let chain = `[vcat]${crop.filter}`;
+  // `zoompan` assigns one output frame per input frame at the requested
+  // timebase. A 23.976 fps source must be resampled to 30 fps *before* it,
+  // otherwise its 322 frames are stamped at 1/30s and the video track ends
+  // 20% early while the audio keeps the full duration.
+  let chain = `[vcat]${crop.filter},fps=30`;
   if (input.plan.zooms.length > 0) {
     const zoom = buildZoomExpression(input.plan.zooms);
     chain += `,zoompan=z='${zoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30`;
-  } else {
-    chain += ',fps=30';
   }
   if (input.captionFile) {
     chain += `,subtitles=${input.captionFile}:fontsdir=${input.fontDir ?? '/fonts'}`;
@@ -88,7 +90,7 @@ export function buildClipRenderArgs(input: ClipRenderInput): string[] {
     '-c:a',
     'aac',
     '-b:a',
-    '128k',
+    '192k',
     '-ar',
     '48000',
     '-ac',

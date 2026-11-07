@@ -44,7 +44,7 @@ async function handlePost(request: Request): Promise<Response> {
     return authError(400, 'password_mismatch', 'The two passwords do not match.');
   }
 
-  const limit = takeRateLimit(`reset:${clientKey(request)}`, 10, 15 * 60_000);
+  const limit = await takeRateLimit(`reset:${clientKey(request)}`, 10, 15 * 60_000);
   if (!limit.ok) {
     return NextResponse.json(
       { error: 'Too many attempts. Wait a few minutes and try again.', code: 'rate_limited' },

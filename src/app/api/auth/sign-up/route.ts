@@ -51,7 +51,7 @@ async function handlePost(request: Request): Promise<Response> {
     return authError(400, 'password_mismatch', 'The two passwords do not match.');
   }
 
-  const limit = takeRateLimit(`sign-up:${clientKey(request)}`, 20, 60 * 60_000);
+  const limit = await takeRateLimit(`sign-up:${clientKey(request)}`, 20, 60 * 60_000);
   if (!limit.ok) {
     return NextResponse.json(
       { error: 'Too many accounts were created from this address. Try again later.', code: 'rate_limited' },

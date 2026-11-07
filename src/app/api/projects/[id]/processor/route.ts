@@ -20,10 +20,20 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
     return jsonError(409, 'source_missing', 'Attach or upload a video file before starting browser processing.');
   }
   const transcript = await db.getTranscript(id);
+  const clips = (await db.getClips(id)).map((clip) => ({
+    id: clip.id,
+    index: clip.index,
+    title: clip.title,
+    startMs: clip.startMs,
+    endMs: clip.endMs,
+    status: clip.status,
+    edits: clip.edits,
+  }));
   return Response.json(
     {
       project,
       transcript,
+      clips,
       sourceMode: local ? 'local' : 'remote',
       sourceUrl: local ? null : `/api/projects/${id}/source/download`,
       sourceBytes: project.sourceBytes,

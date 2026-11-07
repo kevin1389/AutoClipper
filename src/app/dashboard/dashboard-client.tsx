@@ -647,8 +647,9 @@ export function DashboardClient({
                 </span>
               </div>
               <p className="mt-1 text-xs leading-relaxed text-mist-500">
-                Actual object bytes from each reachable provider, with the application reserve kept below the
-                free-tier limit. A failed measurement is shown as unavailable, never as zero.
+                Actual object bytes from each reachable provider. Each provider is hard-capped at its free-tier
+                allowance and the pool at 18 GB aggregate; unverified capacity is never offered for uploads, and a
+                failed measurement is shown as unavailable rather than zero.
               </p>
             </div>
             <button type="button" className="btn-ghost text-xs" onClick={() => void refreshAll()}>
@@ -657,6 +658,7 @@ export function DashboardClient({
           </div>
 
           {storage.available ? (
+            <>
             <div className="mt-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
               <div className="rounded-xl border border-ink-700/70 bg-ink-950/50 p-3">
                 <p className="label">Verified capacity</p>
@@ -695,6 +697,41 @@ export function DashboardClient({
                 </p>
               </div>
             </div>
+
+            {storage.backend === 'pool' ? (
+              <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                <div className="rounded-xl border border-ink-700/60 bg-ink-950/40 p-3">
+                  <p className="label">Configured capacity</p>
+                  <p className="mt-1 font-mono text-base tabular-nums text-mist-200">
+                    {formatStorageBytes(storage.configuredCapacityBytes)}
+                  </p>
+                  <p className="mt-1 text-[10px] leading-relaxed text-mist-500">
+                    What the configured safety caps allow, measured or not.
+                  </p>
+                </div>
+                <div className="rounded-xl border border-emerald-400/25 bg-emerald-400/[0.04] p-3">
+                  <p className="label">Verified capacity</p>
+                  <p className="mt-1 font-mono text-base tabular-nums text-emerald-100">
+                    {formatStorageBytes(storage.verifiedCapacityBytes)}
+                  </p>
+                  <p className="mt-1 text-[10px] leading-relaxed text-emerald-200/60">
+                    Backed by a successful provider listing. Only this can accept uploads.
+                  </p>
+                </div>
+                <div className="rounded-xl border border-amber-500/25 bg-amber-500/[0.05] p-3">
+                  <p className="label">Unverified capacity</p>
+                  <p className="mt-1 font-mono text-base tabular-nums text-amber-100">
+                    {formatStorageBytes(storage.unverifiedCapacityBytes)}
+                  </p>
+                  <p className="mt-1 text-[10px] leading-relaxed text-amber-100/60">
+                    {storage.unverifiedCapacityBytes > 0
+                      ? 'Configured but not measured, so it is excluded from available space.'
+                      : 'Every configured provider has been measured.'}
+                  </p>
+                </div>
+              </div>
+            ) : null}
+            </>
           ) : (
             <p className="mt-4 rounded-xl border border-amber-500/25 bg-amber-500/[0.06] px-3 py-2.5 text-xs leading-relaxed text-amber-100/80">
               {storage.backend === 'pool'
@@ -756,7 +793,13 @@ export function DashboardClient({
                             : 'border-amber-400/30 bg-amber-400/10 text-amber-200'
                         }`}
                       >
-                        {!provider.configured ? 'Not configured' : provider.verified ? 'Connected' : 'Unavailable'}
+                        {!provider.configured
+                          ? 'Not configured'
+                          : provider.verified
+                            ? 'Verified'
+                            : provider.error
+                              ? 'Unavailable'
+                              : 'Not measured'}
                       </span>
                     </div>
                     <div className="mt-4 flex items-baseline justify-between gap-2 font-mono text-xs tabular-nums">
@@ -788,7 +831,7 @@ export function DashboardClient({
                     ) : null}
                     <p className="mt-2 text-[10px] leading-relaxed text-mist-500">
                       {provider.configured
-                        ? `${formatStorageBytes(provider.reserveBytes)} reserve kept below the ${formatStorageBytes(provider.limitBytes)} allowance. Last successful measurement: ${provider.measuredAt ? `${provider.measuredAt.slice(0, 16).replace('T', ' ')} UTC` : 'never'}.`
+                        ? `${formatStorageBytes(provider.reserveBytes)} reserve kept below the ${formatStorageBytes(provider.limitBytes)} allowance. Last successful measurement: ${provider.measuredAt ? `${provider.measuredAt.slice(0, 16).replace('T', ' ')} UTC` : 'never'}. Daily check: ${provider.reconciledAt ? `${provider.reconciledAt.slice(0, 16).replace('T', ' ')} UTC` : 'pending'}.`
                         : `Not configured. Add server-side secrets ${provider.id === 'b2' ? 'AC_B2' : provider.id === 'tigris' ? 'AC_TIGRIS' : 'AC_FILEBASE'}_ACCESS_KEY_ID, _SECRET_ACCESS_KEY, _BUCKET and (if needed) _ENDPOINT/_REGION. Never use NEXT_PUBLIC_* variables or client code. The 18 GB target is not available until all three providers verify.`}
                     </p>
                     {provider.error ? (

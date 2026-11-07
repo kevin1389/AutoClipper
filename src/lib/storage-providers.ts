@@ -78,8 +78,14 @@ export const STORAGE_PROVIDER_DEFINITIONS: StorageProviderDefinition[] = [
   },
 ];
 
+/**
+ * Absolute aggregate ceiling. AC_STORAGE_TARGET_BYTES may lower this, but no
+ * misconfiguration can raise the pool above the three free-tier allowances.
+ */
+export const HARD_AGGREGATE_CAP_BYTES = 18 * GB;
+
 /** Hard aggregate target for the three free tiers. */
-export const DEFAULT_STORAGE_TARGET_BYTES = 18 * GB;
+export const DEFAULT_STORAGE_TARGET_BYTES = HARD_AGGREGATE_CAP_BYTES;
 
 function positiveInt(value: string | undefined, fallback: number): number {
   if (!value) return fallback;
@@ -123,7 +129,12 @@ function configuredFor(def: StorageProviderDefinition): StorageProviderConfig | 
     (def.id === 'b2' ? defaultB2Endpoint(region) : null);
   if (!endpoint || !endpointIsSafe(endpoint)) return null;
 
-  const limitBytes = positiveInt(env(def.envPrefix, 'LIMIT_BYTES'), def.defaultLimitBytes);
+  // The free-tier allowance is also a hard ceiling: an env typo must never let
+  // the pool write past a provider's free allowance and start billing.
+  const limitBytes = Math.min(
+    positiveInt(env(def.envPrefix, 'LIMIT_BYTES'), def.defaultLimitBytes),
+    def.defaultLimitBytes,
+  );
   const reserveBytes = Math.min(
     limitBytes,
     positiveInt(env(def.envPrefix, 'RESERVE_BYTES'), def.defaultReserveBytes),
@@ -174,7 +185,9 @@ export function storagePoolConfigured(): boolean {
 export function storageTargetBytes(): number {
   const configuredTarget = Number(process.env.AC_STORAGE_TARGET_BYTES);
   if (Number.isFinite(configuredTarget) && configuredTarget > 0) {
-    return Math.floor(configuredTarget);
+    // Lowering the target is allowed; raising it above the free-tier ceiling is
+    // not, so an operator cannot accidentally authorize paid capacity.
+    return Math.min(Math.floor(configuredTarget), HARD_AGGREGATE_CAP_BYTES);
   }
   return DEFAULT_STORAGE_TARGET_BYTES;
 }

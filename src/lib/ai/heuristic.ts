@@ -1,4 +1,4 @@
-import type { ClipScoreBreakdown, SelectedClip } from '../types';
+import type { ClipScoreBreakdown, ClipScoreDimension, SelectedClip } from '../types';
 import type { ClipSelector, SelectionInput } from './types';
 import { buildSentences, finalizeSelection, type Sentence } from './select-utils';
 import { emphasisScore } from '../edit/plan';
@@ -45,9 +45,11 @@ const HOOK_PATTERNS: { re: RegExp; label: string; weight: number }[] = [
 ];
 
 const INTRO_PATTERNS: RegExp[] = [
-  /^(hey|hi|hello)( guys| everyone| folks| everybody)?\b/i,
-  /^(welcome back|welcome to)\b/i,
-  /^(in this video|in today'?s video|today (i|we)( want| are| will|'re)?)\b/i,
+  /^(hey|hi|hello|what'?s up|good morning|good afternoon)( guys| everyone| folks| everybody)?\b/i,
+  /^(welcome back|welcome to|thanks for (watching|joining|having me))\b/i,
+  /^(in this (video|episode)|on today'?s (show|episode)|in today'?s video|today (i|we)( want| are| will|'re)?)\b/i,
+  /^(i want to (talk|discuss|share)|let'?s talk about|we'?re going to talk about)\b/i,
+  /^(before we (start|begin|get)|real quick|quick (update|announcement|note))\b/i,
   /^(let'?s (get|dive|jump|start|talk)|before we (start|begin))\b/i,
   /^(as (i|we) (said|mentioned)|like i (said|mentioned))\b/i,
   /^(okay|ok|so|um|uh|yeah)[, ]+(so|yeah|um|uh)?\b/i,
@@ -72,6 +74,7 @@ const PAYOFF_PATTERNS = [
 const RESULT_WORDS = /\b(won|worked|failed|changed|saved|lost|made|earned|doubled|tripled|realized|discovered)\b/i;
 const DANGLING_END = /\b(and|but|because|so|or|if|when|which|that|to|of|with|for|like|you know|i mean|right)\W*$/i;
 const BACKREFERENCE = /\b(as i said|like i mentioned|earlier|previously|that thing|remember when)\b/i;
+const WEAK_END = /\b(you know|or something|kind of|sort of|i guess|we'?ll see|whatever|anyway|right|okay|yeah)\W*$/i;
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'and', 'or', 'but', 'to', 'of', 'in', 'on', 'for', 'with', 'is', 'are',
   'was', 'were', 'be', 'been', 'it', 'this', 'that', 'these', 'those', 'i', 'you', 'we', 'they',
@@ -80,18 +83,19 @@ const STOP_WORDS = new Set([
   'would', 'should', 'will', 'do', 'did', 'does', 'have', 'has', 'had', 'from', 'by', 'about',
 ]);
 
-const WEIGHTS: Record<keyof Omit<ClipScoreBreakdown, 'total'>, number> = {
-  hook: 0.26,
-  entertainment: 0.2,
-  substance: 0.16,
-  context: 0.18,
-  payoff: 0.12,
-  pacing: 0.08,
+export const SCORE_WEIGHTS: Record<ClipScoreDimension, number> = {
+  hook: 0.28,
+  engagement: 0.17,
+  clarity: 0.13,
+  substance: 0.14,
+  context: 0.14,
+  payoff: 0.1,
+  pacing: 0.04,
 };
 
 /** Minimum absolute score, and the fraction of the best clip, worth publishing. */
-const MIN_QUALITY = 0.34;
-const RELATIVE_QUALITY = 0.68;
+export const MIN_QUALITY = 0.34;
+export const RELATIVE_QUALITY = 0.68;
 
 function countMatches(text: string, re: RegExp): number {
   const global = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
@@ -159,17 +163,33 @@ function contentWords(text: string): Set<string> {
     text
       .toLowerCase()
       .split(/[^a-z0-9']+/)
-      .filter((word) => word.length > 2 && !STOP_WORDS.has(word)),
+      // Keep short numbers: "Example 1" vs "Example 5" is real new detail and
+      // must count when deciding whether two moments repeat each other.
+      .filter((word) => (word.length > 2 || /^\d+$/.test(word)) && !STOP_WORDS.has(word)),
   );
 }
 
-function textSimilarity(a: string, b: string): number {
+export function textSimilarity(a: string, b: string): number {
   const left = contentWords(a);
   const right = contentWords(b);
   if (left.size < 4 || right.size < 4) return 0;
   let shared = 0;
   for (const word of left) if (right.has(word)) shared += 1;
   return shared / Math.min(left.size, right.size);
+}
+
+function repeatedNgramRatio(tokens: string[], size: number): number {
+  if (tokens.length < size + 2) return 0;
+  const seen = new Set<string>();
+  let repeats = 0;
+  let total = 0;
+  for (let index = 0; index <= tokens.length - size; index += 1) {
+    const gram = tokens.slice(index, index + size).join(' ');
+    total += 1;
+    if (seen.has(gram)) repeats += 1;
+    else seen.add(gram);
+  }
+  return total > 0 ? repeats / total : 0;
 }
 
 interface Candidate {
@@ -224,35 +244,38 @@ function classifyContent(text: string, numbers: number, causalClaims: number, ad
   return { type, scores, evidence };
 }
 
-function openingHook(opening: string, firstTwoSeconds: string): { score: number; evidence: string[] } {
+function openingHook(opening: string, firstThreeSeconds: string): { score: number; evidence: string[] } {
   const evidence: string[] = [];
-  let score = 0.12;
-  const search = `${opening} ${firstTwoSeconds}`.toLowerCase();
+  // The opening three seconds are the only place a scrolling viewer sees before
+  // deciding. A pattern later in a long first sentence must not count as a hook.
+  const hookText = (firstThreeSeconds.trim() || opening.split(/\s+/).slice(0, 18).join(' ')).toLowerCase();
+  let score = 0.08;
 
   for (const signal of HOOK_PATTERNS) {
-    if (signal.re.test(search)) {
+    if (signal.re.test(hookText)) {
       score += signal.weight;
       evidence.push(signal.label);
     }
   }
-  if (hasMatch(opening, /\?/)) {
+  if (hasMatch(hookText, /\?/)) {
     score += 0.32;
     evidence.push('opens with a question');
   }
-  if (hasMatch(firstTwoSeconds, /\b\d{1,4}(?:[.,]\d+)?%?\b/)) {
+  if (hasMatch(hookText, /\b\d{1,4}(?:[.,]\d+)?%?\b/)) {
     score += 0.18;
     evidence.push('opens with a concrete number');
   }
-  if (hasMatch(opening, /\b(you|your)\b/i)) {
+  if (hasMatch(hookText, /\b(you|your)\b/i)) {
     score += 0.12;
     evidence.push('speaks directly to the viewer');
   }
-  if (INTRO_PATTERNS.some((pattern) => pattern.test(opening))) {
-    score -= 0.42;
+  if (INTRO_PATTERNS.some((pattern) => pattern.test(hookText))) {
+    score -= 0.5;
     evidence.push('slow introduction');
   }
-  if (CONTEXT_DEPENDENT_START.test(opening.trim())) score -= 0.14;
-  if (FILLER_START.test(opening.trim())) score -= 0.1;
+  if (CONTEXT_DEPENDENT_START.test(hookText.trim())) score -= 0.16;
+  if (FILLER_START.test(hookText.trim())) score -= 0.12;
+  if (hookText.split(/\s+/).filter(Boolean).length < 4) score -= 0.12;
 
   return { score: clampScore(score), evidence: [...new Set(evidence)] };
 }
@@ -273,8 +296,8 @@ export function scoreCandidateWindow(
   const lower = text.toLowerCase();
   const opening = sentences[from].text;
   const closing = sentences[to].text;
-  const firstTwoSeconds = input.words
-    .filter((word) => word.startMs >= startMs && word.startMs < startMs + 2_000)
+  const firstThreeSeconds = input.words
+    .filter((word) => word.endMs > startMs && word.startMs < startMs + 3_000)
     .map((word) => word.text)
     .join(' ');
   const words = lower.split(/[^a-z'0-9]+/).filter(Boolean);
@@ -288,13 +311,31 @@ export function scoreCandidateWindow(
   const content = classifyContent(text, numbers, causalClaims, advice);
   const evidence = new Set<string>(content.evidence);
 
-  /* ---- hook: can the first two seconds stop a scroll? ---- */
-  const hookResult = openingHook(opening, firstTwoSeconds);
+  const internalGaps = input.words
+    .filter((word) => word.startMs > startMs && word.endMs < endMs)
+    .reduce((longest, word, index, list) => {
+      const previous = list[index - 1];
+      return previous ? Math.max(longest, word.startMs - previous.endMs) : longest;
+    }, 0);
+  const fillerCount = words.filter((word) => FILLER_WORDS.has(word)).length;
+  const fillerRatio = fillerCount / Math.max(1, wordCount);
+  const repeatedPhraseRatio = repeatedNgramRatio(words, 4);
+  const openingWindow = firstThreeSeconds || opening;
+  const signals = input.signals;
+  const audioLevels = signals
+    ? signals.audio
+        .filter((level) => level.tMs >= startMs && level.tMs <= endMs)
+        .map((level) => level.rms)
+    : [];
+  const loudness = audioLevels.length > 0 ? mean(audioLevels) : null;
+
+  /* ---- hook: what lands in the first one to three seconds? ---- */
+  const hookResult = openingHook(opening, firstThreeSeconds);
   hookResult.evidence.forEach((label) => evidence.add(label));
   const hook = hookResult.score;
 
-  /* ---- entertainment: laughter, surprise, drama, emotion and reactions ---- */
-  let entertainment = Math.max(
+  /* ---- engagement: laughter, surprise, drama, emotion and reactions ---- */
+  let engagement = Math.max(
     content.scores.funny,
     content.scores.surprising,
     content.scores.dramatic,
@@ -302,9 +343,9 @@ export function scoreCandidateWindow(
     content.scores.informative * 0.75,
   );
   const exclamations = countMatches(text, /!/g);
-  entertainment = Math.min(1, entertainment + exclamations * 0.04);
+  engagement = Math.min(1, engagement + exclamations * 0.04);
   if (hasMatch(text, /\b(laugh|crying|screaming|yelling|gasping)\b/i)) {
-    entertainment = Math.min(1, entertainment + 0.12);
+    engagement = Math.min(1, engagement + 0.12);
     evidence.add('audible reaction');
   }
 
@@ -320,9 +361,10 @@ export function scoreCandidateWindow(
 
   /* ---- context: can a stranger follow it without the previous minute? ---- */
   let context = 0.52;
-  if (INTRO_PATTERNS.some((pattern) => pattern.test(opening))) context -= 0.3;
-  if (CONTEXT_DEPENDENT_START.test(opening.trim())) context -= 0.14;
-  if (hasMatch(text, BACKREFERENCE)) context -= 0.26;
+  if (INTRO_PATTERNS.some((pattern) => pattern.test(openingWindow))) context -= 0.34;
+  if (CONTEXT_DEPENDENT_START.test(openingWindow.trim())) context -= 0.18;
+  if (hasMatch(text, BACKREFERENCE)) context -= 0.3;
+  if (repeatedPhraseRatio > 0.2) context -= 0.12;
   if (!sentences[from].terminal) context += 0.03; // a continuing thought is normal at the start
   if (durationMs >= 12_000) context += 0.13;
   if (durationMs >= 20_000) context += 0.05;
@@ -344,10 +386,34 @@ export function scoreCandidateWindow(
   }
   if (RESULT_WORDS.test(closing)) payoff += 0.14;
   if (DANGLING_END.test(closing.trim())) payoff -= 0.28;
+  if (WEAK_END.test(closing.trim())) payoff -= 0.16;
   if (!sentences[to].terminal) payoff -= 0.24;
   if (/\.\.\.$/.test(closing.trim())) payoff -= 0.16;
   payoff = clampScore(payoff);
   if (payoff >= 0.62) evidence.add('complete, resolved ending');
+
+  /* ---- clarity: clean, coherent speech without repeated filler ---- */
+  let clarity = 0.58;
+  if (INTRO_PATTERNS.some((pattern) => pattern.test(openingWindow))) clarity -= 0.16;
+  if (CONTEXT_DEPENDENT_START.test(openingWindow.trim())) clarity -= 0.12;
+  if (FILLER_START.test(openingWindow.trim())) clarity -= 0.1;
+  if (hasMatch(text, BACKREFERENCE)) clarity -= 0.2;
+  if (!sentences[from].terminal) clarity -= 0.04;
+  if (sentences[to].terminal) clarity += 0.12;
+  else clarity -= 0.16;
+  if (DANGLING_END.test(closing.trim())) clarity -= 0.2;
+  if (WEAK_END.test(closing.trim())) clarity -= 0.16;
+  if (fillerRatio > 0.08) clarity -= 0.12;
+  if (internalGaps > 2_000) clarity -= 0.1;
+  else if (internalGaps > 1_200) clarity -= 0.04;
+  const averageSentenceWords = wordCount / Math.max(1, sentenceCount);
+  if (averageSentenceWords < 4) clarity -= 0.1;
+  else if (averageSentenceWords <= 24) clarity += 0.06;
+  if (wordCount >= 25) clarity += 0.04;
+  if (repeatedPhraseRatio > 0.16) clarity -= 0.14;
+  if (loudness !== null && loudness < -38) clarity -= 0.08;
+  clarity = clampScore(clarity);
+  if (clarity >= 0.72) evidence.add('clear, coherent delivery');
 
   /* ---- pacing: speech density, fillers and internal dead air ---- */
   let pacing = 0.44;
@@ -355,27 +421,17 @@ export function scoreCandidateWindow(
   else if (wordsPerSecond < 1.1) pacing -= 0.26;
   else if (wordsPerSecond > 5.2) pacing -= 0.1;
   if (durationMs >= 12_000 && durationMs <= 38_000) pacing += 0.08;
-
-  const internalGaps = input.words
-    .filter((word) => word.startMs > startMs && word.endMs < endMs)
-    .reduce((longest, word, index, list) => {
-      const previous = list[index - 1];
-      return previous ? Math.max(longest, word.startMs - previous.endMs) : longest;
-    }, 0);
   if (internalGaps > 2_000) pacing -= 0.2;
   else if (internalGaps > 1_200) pacing -= 0.08;
-  const fillerCount = words.filter((word) => FILLER_WORDS.has(word)).length;
-  const fillerRatio = fillerCount / Math.max(1, wordCount);
   if (fillerRatio > 0.1) pacing -= 0.14;
   pacing = clampScore(pacing);
   if (pacing >= 0.72) evidence.add('natural conversational pacing');
 
   /* ---- measured signals: audio peaks and visual changes ---- */
-  const signals = input.signals;
   if (signals) {
     const peaksInside = signals.peaksMs.filter((peak) => peak >= startMs && peak <= endMs).length;
     if (peaksInside > 0) {
-      entertainment = Math.min(1, entertainment + Math.min(0.26, peaksInside * 0.1));
+      engagement = Math.min(1, engagement + Math.min(0.26, peaksInside * 0.1));
       evidence.add(`${peaksInside} audio peak${peaksInside === 1 ? '' : 's'}`);
     }
     const scenesInside = signals.sceneChangesMs.filter((scene) => scene >= startMs && scene <= endMs).length;
@@ -383,19 +439,17 @@ export function scoreCandidateWindow(
       pacing = Math.min(1, pacing + 0.06);
       evidence.add(`${scenesInside} visual change${scenesInside === 1 ? '' : 's'}`);
     }
-    const loudness = mean(
-      signals.audio.filter((level) => level.tMs >= startMs && level.tMs <= endMs).map((level) => level.rms),
-    );
-    if (loudness > -22) entertainment = Math.min(1, entertainment + 0.08);
+    if (loudness !== null && loudness > -22) engagement = Math.min(1, engagement + 0.08);
   }
 
   const total =
-    hook * WEIGHTS.hook +
-    entertainment * WEIGHTS.entertainment +
-    substance * WEIGHTS.substance +
-    context * WEIGHTS.context +
-    payoff * WEIGHTS.payoff +
-    pacing * WEIGHTS.pacing;
+    hook * SCORE_WEIGHTS.hook +
+    engagement * SCORE_WEIGHTS.engagement +
+    clarity * SCORE_WEIGHTS.clarity +
+    substance * SCORE_WEIGHTS.substance +
+    context * SCORE_WEIGHTS.context +
+    payoff * SCORE_WEIGHTS.payoff +
+    pacing * SCORE_WEIGHTS.pacing;
 
   if (hook >= 0.58) evidence.add('strong opening hook');
   if (context >= 0.76) evidence.add('stands alone without prior context');
@@ -405,7 +459,8 @@ export function scoreCandidateWindow(
 
   const breakdown: ClipScoreBreakdown = {
     hook: clampScore(hook),
-    entertainment: clampScore(entertainment),
+    engagement: clampScore(engagement),
+    clarity: clampScore(clarity),
     substance: clampScore(substance),
     context: clampScore(context),
     payoff: clampScore(payoff),
@@ -434,7 +489,7 @@ function toSelectedClip(
   const title = pickTitle(sentences, candidate.from, candidate.to, usedTitles);
   usedTitles.add(title.toLowerCase());
   const strongest = (Object.entries(candidate.breakdown) as [keyof ClipScoreBreakdown, number][])
-    .filter(([key]) => key !== 'total')
+    .filter(([key]) => key !== 'total' && key !== 'entertainment')
     .sort((a, b) => b[1] - a[1])
     .slice(0, 3)
     .map(([key]) => key)
@@ -518,9 +573,10 @@ export function selectHighlightsHeuristically(input: SelectionInput): SelectedCl
           ? candidate.startMs - existing.endMs
           : existing.startMs - candidate.endMs;
       if (gap < 4_000) return false;
-      // Reject only near-identical windows. A 45-minute video can legitimately
-      // revisit a theme; exact duplicate content is still stopped.
-      return textSimilarity(existing.text, candidate.text) <= 0.93;
+      // Reject substantially repeated content, not merely a shared theme. A
+      // 45-minute video can legitimately revisit an idea, but two clips that
+      // repeat the same wording should not both survive.
+      return textSimilarity(existing.text, candidate.text) <= 0.88;
     });
 
   for (const candidate of qualified) {
@@ -539,9 +595,11 @@ export function selectHighlightsHeuristically(input: SelectionInput): SelectedCl
     return [];
   }
 
+  // Return strongest-first. Persisted clip order is the estimated potential
+  // ranking, while each clip still carries its own evidence and score.
   return chosen
-    .sort((a, b) => a.startMs - b.startMs)
-    .map((candidate) => toSelectedClip(candidate, sentences, usedTitles, false));
+    .map((candidate) => toSelectedClip(candidate, sentences, usedTitles, false))
+    .sort((a, b) => b.score - a.score);
 }
 
 export function createHeuristicSelector(): ClipSelector {

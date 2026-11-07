@@ -5,6 +5,8 @@ import {
   buildZoomExpression,
   distributeCaptionText,
   emphasisScore,
+  MAX_ZOOM_SCALE,
+  MIN_ZOOM_SCALE,
 } from '../src/lib/edit/plan';
 import type { MediaSignals } from '../src/lib/media/signals';
 import type { TimedWord } from '../src/lib/types';
@@ -68,7 +70,7 @@ test('zooms are placed on emphasis words, scaled by intensity and kept inside th
 
   const expression = buildZoomExpression(plan.zooms);
   assert.match(expression, /clip\(\(it-/);
-  assert.match(expression, /^min\(1\.15,1\+/);
+  assert.match(expression, /^min\(1\.10,1\+/);
 });
 
 test('disabling zooms or slow motion removes those effects entirely', () => {
@@ -96,6 +98,7 @@ test('slow motion requires a real visual change, not just emphasis', () => {
     words: payoffWords,
     startMs: 0,
     endMs: 9_500,
+    options: { slowMotionEnabled: true },
     signals: { ...noSignals, peaksMs: [7_600], sceneChangesMs: [7_500], source: { audio: true, visual: true } },
   });
   assert.equal(withScene.slowMotion.length, 1, 'scene change + peak + emphasis should allow one slow window');
@@ -105,6 +108,7 @@ test('slow motion requires a real visual change, not just emphasis', () => {
     words: payoffWords,
     startMs: 0,
     endMs: 9_500,
+    options: { slowMotionEnabled: true },
     signals: { ...noSignals, peaksMs: [7_600], source: { audio: true, visual: false } },
   });
   assert.equal(withoutScene.slowMotion.length, 0, 'no visual evidence means no slow motion');
@@ -127,6 +131,37 @@ test('custom caption text is distributed across the edited duration', () => {
   assert.equal(plan.captionWords[0].startMs, 0);
   assert.ok(plan.captionWords[7].endMs <= plan.outputDurationMs);
   assert.match(plan.effectsSummary.join(' '), /custom caption text/i);
+});
+
+test('defaults stay restrained: slow motion is off and zoom stays inside 1.03–1.10', () => {
+  const plan = buildEditPlan({
+    words: spacedWords,
+    startMs: 0,
+    endMs: 5_600,
+    signals: { ...noSignals, peaksMs: [1_000], sceneChangesMs: [1_000] },
+  });
+  assert.equal(plan.slowMotion.length, 0, 'slow motion must be opt-in');
+  assert.ok(plan.zooms.length > 0);
+  for (const zoom of plan.zooms) {
+    assert.ok(zoom.scale >= MIN_ZOOM_SCALE && zoom.scale <= MAX_ZOOM_SCALE);
+  }
+
+  const gentle = buildEditPlan({
+    words: spacedWords,
+    startMs: 0,
+    endMs: 5_600,
+    options: { zoomIntensity: 0.4, slowMotionEnabled: false },
+    signals: { ...noSignals, peaksMs: [1_000] },
+  });
+  const strongest = buildEditPlan({
+    words: spacedWords,
+    startMs: 0,
+    endMs: 5_600,
+    options: { zoomIntensity: 2, slowMotionEnabled: false },
+    signals: { ...noSignals, peaksMs: [1_000] },
+  });
+  assert.equal(gentle.zooms[0]?.scale, MIN_ZOOM_SCALE);
+  assert.equal(strongest.zooms[0]?.scale, MAX_ZOOM_SCALE);
 });
 
 test('emphasis scoring is deterministic and explainable', () => {

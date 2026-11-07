@@ -15,7 +15,7 @@ const extraDevOrigins = (process.env.AC_ALLOWED_DEV_ORIGINS ?? '')
 const nextConfig: NextConfig = {
   // FFmpeg binaries, ffprobe and archiver are native/CJS packages that must not be
   // bundled by the server compiler.
-  serverExternalPackages: ['ffmpeg-static', 'ffprobe-static', 'archiver'],
+  serverExternalPackages: ['ffmpeg-static', '@ffprobe-installer/ffprobe', 'archiver'],
   // The caption font has to ship with the server build so libass can find it at runtime.
   outputFileTracingIncludes: {
     '/api/**': ['./assets/fonts/**'],

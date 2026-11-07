@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { selectHighlightsHeuristically } from '../src/lib/ai/heuristic';
+import { scoreCandidateWindow, selectHighlightsHeuristically, textSimilarity } from '../src/lib/ai/heuristic';
 import { buildSentences } from '../src/lib/ai/select-utils';
 import type { MediaSignals } from '../src/lib/media/signals';
 import type { TimedWord } from '../src/lib/types';
@@ -74,11 +74,22 @@ test('selection returns 5-10 explainable, non-overlapping clips from a long tran
     assert.ok(clip.reason.length > 0, 'every clip explains itself');
     assert.ok(clip.scoreBreakdown, 'score breakdown must be persisted');
     assert.ok((clip.scoreBreakdown?.total ?? 0) > 0);
-    assert.ok((clip.scoreBreakdown?.hook ?? 0) <= 1 && (clip.scoreBreakdown?.payoff ?? 0) <= 1);
+    for (const field of ['hook', 'engagement', 'clarity', 'substance', 'context', 'payoff', 'pacing'] as const) {
+      const value: number | undefined = clip.scoreBreakdown?.[field];
+      assert.ok(typeof value === 'number' && value >= 0 && value <= 1, `${field} must be a 0-1 score`);
+    }
     assert.ok((clip.evidence?.length ?? 0) > 0, 'clips must cite the evidence that selected them');
     if (index > 0) {
-      assert.ok(clip.startMs >= clips[index - 1].endMs, 'clips must not overlap');
+      assert.ok(clips[index - 1].score >= clip.score, 'clips must be ranked by estimated potential');
     }
+  }
+
+  const chronological = [...clips].sort((a, b) => a.startMs - b.startMs);
+  for (let index = 1; index < chronological.length; index += 1) {
+    assert.ok(
+      chronological[index].startMs >= chronological[index - 1].endMs,
+      'ranked clips must still be non-overlapping',
+    );
   }
 });
 
@@ -88,6 +99,64 @@ test('strong hooks outrank filler of the same length', () => {
   const clips = selectHighlightsHeuristically({ words, segments: [], durationMs, targetCount: 8, signals });
   const best = [...clips].sort((a, b) => (b.scoreBreakdown?.total ?? 0) - (a.scoreBreakdown?.total ?? 0))[0];
   assert.ok((best.scoreBreakdown?.hook ?? 0) >= 0.3, 'the strongest clip should open with a real hook');
+});
+
+test('slow introductions, weak endings and filler rank below a strong standalone hook', () => {
+  const strongSentence =
+    'Here is the biggest mistake nobody tells you about clipping long videos because the opening three seconds decides whether anyone keeps watching, and that is why we always cut straight to the point and end with a clear result.';
+  const weakSentence =
+    'So we were talking about the timeline and how it moves when you drag the clip, and then the audio drifted a little and we had to nudge it back into place, and honestly it was just kind of a normal day, you know.';
+  const timed = (sentence: string, startMs: number): TimedWord[] =>
+    sentence.split(' ').map((text, index) => ({
+      text,
+      startMs: startMs + index * 300,
+      endMs: startMs + index * 300 + 260,
+    }));
+  const strongWords = timed(strongSentence, 0);
+  const weakStart = strongWords[strongWords.length - 1].endMs + 4_000;
+  const weakWords = timed(weakSentence, weakStart);
+  const words = [...strongWords, ...weakWords];
+  const input = {
+    words,
+    segments: [],
+    durationMs: weakWords[weakWords.length - 1].endMs + 1_000,
+    targetCount: 2,
+  };
+  const sentences = buildSentences(words, []);
+  const strong = scoreCandidateWindow(input, sentences, 0, 1);
+  const weak = scoreCandidateWindow(input, sentences, 2, 2);
+
+  assert.ok(strong && weak);
+  assert.ok(strong.breakdown.hook > weak.breakdown.hook, 'the real hook must beat the introduction');
+  assert.ok(strong.breakdown.clarity > weak.breakdown.clarity, 'clear speech must beat filler and a weak ending');
+  assert.ok(strong.breakdown.payoff > weak.breakdown.payoff, 'a resolved ending must score higher');
+  assert.ok(strong.breakdown.total > weak.breakdown.total);
+});
+
+test('identical repeated sections are not padded into a full set', () => {
+  const sentence =
+    'Here is the biggest mistake nobody tells you about clipping long videos because the opening three seconds decides whether anyone keeps watching, and that is why we always cut straight to the point and end with a clear result.';
+  const words: TimedWord[] = [];
+  for (let copy = 0; copy < 8; copy += 1) {
+    sentence.split(' ').forEach((text, index) => {
+      words.push({ text, startMs: copy * 12_000 + index * 300, endMs: copy * 12_000 + index * 300 + 260 });
+    });
+  }
+  const clips = selectHighlightsHeuristically({
+    words,
+    segments: [],
+    durationMs: 8 * 12_000 + 1_000,
+    targetCount: 8,
+  });
+  assert.ok(clips.length <= 2, `repeated copies should not create a full set, got ${clips.length}`);
+  for (let left = 0; left < clips.length; left += 1) {
+    for (let right = left + 1; right < clips.length; right += 1) {
+      assert.ok(
+        textSimilarity(clips[left].hook, clips[right].hook) < 0.95,
+        'surviving clips must not repeat the same wording',
+      );
+    }
+  }
 });
 
 test('no speech means no clips, and a short video is never over-filled', () => {

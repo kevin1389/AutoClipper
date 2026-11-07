@@ -72,7 +72,7 @@ export function resolveEdits(clip: Clip): ClipEdits {
     captionText: base?.captionText ?? null,
     zoomEnabled: base?.zoomEnabled ?? true,
     zoomIntensity: base?.zoomIntensity ?? 1,
-    slowMotionEnabled: base?.slowMotionEnabled ?? true,
+    slowMotionEnabled: base?.slowMotionEnabled ?? false,
   };
 }
 

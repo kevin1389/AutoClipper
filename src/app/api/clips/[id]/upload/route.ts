@@ -70,6 +70,7 @@ export async function PUT(request: Request, context: { params: Promise<{ id: str
           asset,
           provider: object.providerId,
           path: storageObjectPath(object),
+          key: object.key,
         },
         { headers: { 'cache-control': 'private, no-store' } },
       );

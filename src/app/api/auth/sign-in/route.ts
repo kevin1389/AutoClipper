@@ -7,7 +7,17 @@ import { isValidEmail, normalizeEmail } from '@/lib/email';
 import { mailDelivery } from '@/lib/mailer';
 import { isSecureRequest } from '@/lib/origin';
 import { hashPassword, verifyPassword } from '@/lib/password';
-import { clearRateLimit, takeRateLimit } from '@/lib/rate-limit';
+import { clearRateLimit, maybePurgeRateLimits, takeRateLimit } from '@/lib/rate-limit';
+
+// Sign-in throttling is durable (shared database), so these limits hold across
+// every Worker rather than resetting per isolate. The account bucket cannot be
+// spoofed; the client bucket bounds guessing spread over many accounts.
+const SIGN_IN_WINDOW_MS = Math.max(
+  60_000,
+  Number(process.env.AC_SIGNIN_RATE_WINDOW_MS) || 15 * 60_000,
+);
+const SIGN_IN_ACCOUNT_LIMIT = Math.max(1, Number(process.env.AC_SIGNIN_ACCOUNT_LIMIT) || 10);
+const SIGN_IN_CLIENT_LIMIT = Math.max(1, Number(process.env.AC_SIGNIN_CLIENT_LIMIT) || 30);
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -35,14 +45,20 @@ async function handlePost(request: Request): Promise<Response> {
     return authError(400, 'invalid_credentials_format', 'Enter a valid email address and password.');
   }
 
-  const key = `sign-in:${clientKey(request)}:${email}`;
-  const limit = takeRateLimit(key, 10, 15 * 60_000);
-  if (!limit.ok) {
+  const accountKey = `sign-in:account:${email}`;
+  const clientKeyId = `sign-in:client:${clientKey(request)}`;
+  const [accountLimit, clientLimit] = await Promise.all([
+    takeRateLimit(accountKey, SIGN_IN_ACCOUNT_LIMIT, SIGN_IN_WINDOW_MS),
+    takeRateLimit(clientKeyId, SIGN_IN_CLIENT_LIMIT, SIGN_IN_WINDOW_MS),
+  ]);
+  void maybePurgeRateLimits();
+  if (!accountLimit.ok || !clientLimit.ok) {
+    const retryAfter = Math.max(accountLimit.retryAfter, clientLimit.retryAfter);
     return NextResponse.json(
       { error: 'Too many sign-in attempts. Wait a few minutes and try again.', code: 'rate_limited' },
       {
         status: 429,
-        headers: { 'cache-control': 'private, no-store', 'retry-after': String(limit.retryAfter) },
+        headers: { 'cache-control': 'private, no-store', 'retry-after': String(retryAfter) },
       },
     );
   }
@@ -72,7 +88,8 @@ async function handlePost(request: Request): Promise<Response> {
     await markEmailVerified(user.id);
   }
 
-  clearRateLimit(key);
+  await clearRateLimit(accountKey);
+  await clearRateLimit(clientKeyId);
   const response = NextResponse.json(
     { ok: true, user: { id: user.id, email: user.email, name: user.name } },
     { headers: { 'cache-control': 'private, no-store' } },

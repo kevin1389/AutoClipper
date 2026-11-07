@@ -3,11 +3,17 @@ import Link from 'next/link';
 export function Logo({ compact = false }: { compact?: boolean }) {
   return (
     <Link href="/" className="group flex items-center gap-2.5">
-      <span className="relative flex h-8 w-8 items-center justify-center overflow-hidden rounded-[10px] bg-white">
-        <span className="absolute inset-x-[5px] top-[10px] h-[3px] rounded-full bg-black/80" />
-        <span className="absolute inset-x-[5px] top-[16px] h-[3px] rounded-full bg-black/50" />
-        <span className="absolute right-[6px] bottom-[6px] h-[3px] w-[8px] rounded-full bg-black" />
-      </span>
+      <img
+        src="/Autoclipperlogo.png?v=42914c3d"
+        alt=""
+        aria-hidden="true"
+        width={1080}
+        height={1080}
+        loading="eager"
+        decoding="async"
+        draggable={false}
+        className="block h-10 w-auto shrink-0 object-contain sm:h-12"
+      />
       <span className="text-[15px] font-semibold tracking-tight text-white">
         Auto<span className="text-mist-400">Clipper</span>
       </span>
