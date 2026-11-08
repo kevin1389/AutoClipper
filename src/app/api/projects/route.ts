@@ -4,7 +4,7 @@ import path from 'node:path';
 import { config, processingBlocker, publicConfig } from '@/lib/env';
 import * as db from '@/lib/db';
 import { requireUser, sameOriginError } from '@/lib/api-auth';
-import { jsonError } from '@/lib/http';
+import { jsonError, unexpectedErrorResponse } from '@/lib/http';
 import { probeMedia } from '@/lib/media/ffmpeg';
 import { ensureProjectDirs } from '@/lib/storage';
 import { MAX_SOURCE_BYTES, localSourcePath } from '@/lib/upload-limits';
@@ -45,6 +45,19 @@ export async function GET() {
 }
 
 export async function POST(request: Request) {
+  try {
+    return await createProject(request);
+  } catch (error) {
+    console.error('[api/projects] project creation failed:', error);
+    return unexpectedErrorResponse(
+      error,
+      'project_create_failed',
+      'Could not create the project',
+    );
+  }
+}
+
+async function createProject(request: Request) {
   const auth = await requireUser();
   if ('response' in auth) return auth.response;
   const originError = sameOriginError(request);
@@ -87,7 +100,6 @@ export async function POST(request: Request) {
     }
 
     const id = randomUUID();
-    await ensureProjectDirs(id);
     const common = {
       id,
       ownerId,
@@ -235,7 +247,6 @@ export async function POST(request: Request) {
       // from the user. The normal client keeps that File local; the explicit
       // server-copy path remains available for older clients.
       const id = randomUUID();
-      await ensureProjectDirs(id);
       const localRequest = payload.local === true;
       if (localRequest) {
         const validation = validateUploadCandidate(String(payload.fileName ?? ''), payload.size ?? null);

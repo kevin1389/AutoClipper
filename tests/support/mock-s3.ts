@@ -20,6 +20,8 @@ export interface MockS3 {
   failPuts: boolean;
   /** Fails direct PUTs for specific buckets, to exercise provider failover. */
   failPutsFor: Set<string>;
+  /** Simulates a provider whose HEAD is denied (for example, a B2 Class B cap). */
+  failHeadsFor: Set<string>;
   failDeletes: Set<string>;
   failBucketChecks: Set<string>;
   /** Fails LIST for specific buckets, to exercise a failed reconciliation. */
@@ -182,6 +184,7 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
   const state = {
     failPuts: false,
     failPutsFor: new Set<string>(),
+    failHeadsFor: new Set<string>(),
     putAttempts: new Map<string, number>(),
     listRequests: new Map<string, number>(),
     failDeletes: new Set<string>(),
@@ -344,6 +347,10 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
     const existing = key ? bucketObjects.get(key) : undefined;
     if (req.method === 'HEAD' && key) {
       if (failBucket()) return;
+      if (state.failHeadsFor.has(bucket)) {
+        sendError(res, 403, 'AccessDenied', 'Simulated read/download cap exceeded.');
+        return;
+      }
       if (!existing) {
         res.writeHead(404);
         res.end();
@@ -416,6 +423,7 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
       state.failPuts = value;
     },
     failPutsFor: state.failPutsFor,
+    failHeadsFor: state.failHeadsFor,
     failDeletes: state.failDeletes,
     failBucketChecks: state.failBucketChecks,
     failLists: state.failLists,
@@ -451,6 +459,7 @@ export async function createMockS3(input: MockS3Options = {}): Promise<MockS3> {
       uploads.clear();
       state.failPuts = false;
       state.failPutsFor.clear();
+      state.failHeadsFor.clear();
       state.putAttempts.clear();
       state.listRequests.clear();
       state.failDeletes.clear();

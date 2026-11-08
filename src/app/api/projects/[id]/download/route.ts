@@ -74,18 +74,34 @@ export async function GET(_request: Request, context: { params: Promise<{ id: st
     clips: { index: number; title: string; startMs: number; endMs: number; file: string }[];
   } = { project: project.title, generatedAt: new Date().toISOString(), clips: [] };
 
-  for (const clip of clips) {
-    const detailed = await db.getClipForOwner(clip.id, auth.user.id);
-    if (!detailed?.filePath || !(await pathExists(detailed.filePath))) continue;
-    const fileName = `${String(clip.index + 1).padStart(2, '0')}-${slugify(clip.title)}.mp4`;
-    if (!(await appendStorageFile(archive, detailed.filePath, fileName))) continue;
-    manifest.clips.push({
-      index: clip.index + 1,
-      title: clip.title,
-      startMs: clip.startMs,
-      endMs: clip.endMs,
-      file: fileName,
-    });
+  try {
+    for (const clip of clips) {
+      const detailed = await db.getClipForOwner(clip.id, auth.user.id);
+      if (!detailed?.filePath || !(await pathExists(detailed.filePath))) continue;
+      const fileName = `${String(clip.index + 1).padStart(2, '0')}-${slugify(clip.title)}.mp4`;
+      if (!(await appendStorageFile(archive, detailed.filePath, fileName))) continue;
+      manifest.clips.push({
+        index: clip.index + 1,
+        title: clip.title,
+        startMs: clip.startMs,
+        endMs: clip.endMs,
+        file: fileName,
+      });
+    }
+  } catch (error) {
+    // The response has not started yet, so report a retryable storage failure
+    // instead of streaming a truncated ZIP to the browser.
+    try {
+      archive.abort();
+    } catch {
+      // The archive may not have started.
+    }
+    return jsonError(
+      503,
+      'zip_storage_unavailable',
+      `The clip archive could not be prepared because storage did not return a complete file. Retry the download. ${(error as Error).message.slice(0, 300)}`,
+      { retryable: true },
+    );
   }
 
   if (manifest.clips.length === 0) {

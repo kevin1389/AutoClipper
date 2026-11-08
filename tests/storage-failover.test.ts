@@ -107,6 +107,29 @@ test('a failed provider upload fails over to the next provider without duplicate
   assert.equal((await db.sumActiveStorageReservations()).count, 0);
 });
 
+test('a provider with a denied HEAD fails over after LIST confirms no orphan', async () => {
+  resetAll();
+  const projectId = newProject();
+  mock.failHeadsFor.add('test-b2');
+
+  const record = await put(projectId, 100);
+
+  assert.equal(record.providerId, 'tigris');
+  assert.equal(record.status, 'complete');
+  assert.equal(mock.putAttempts('test-b2'), 1);
+  assert.equal(mock.putAttempts('test-tigris'), 1);
+  assert.equal(mock.objectCount('test-b2'), 0, 'the failed provider must hold no orphan');
+  assert.equal(mock.objectCount('test-tigris'), 1);
+
+  const records = await db.getStorageObjectsForProject(projectId);
+  assert.equal(records.filter((entry) => entry.status === 'complete').length, 1);
+  const failed = records.find((entry) => entry.status === 'failed');
+  assert.ok(failed);
+  assert.match(failed.lastError ?? '', /read\/download cap/);
+  assert.match(failed.lastError ?? '', /Object check failed \(HTTP 403\)/);
+  assert.equal((await db.sumActiveStorageReservations()).count, 0);
+});
+
 test('failover stops at the retry limit and leaves no reservations or objects', async () => {
   resetAll();
   const projectId = newProject();

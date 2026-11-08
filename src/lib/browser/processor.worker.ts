@@ -7,9 +7,21 @@ import { selectHighlightsHeuristically } from '../ai/heuristic';
 import { finalizeSelection } from '../ai/select-utils';
 import type { ClipEdits, ClipEffects, ClipFraming, ClipView, PipelineStage, TimedWord } from '../types';
 import { decodeWav, segmentsFromWords, signalsFromSamples, type DecodedAudio } from './audio';
-import type { BrowserSignals, PosterResponse, RenderClipMessage, StartMessage, WorkerEvent, WorkerRequest } from './protocol';
+import type {
+  BrowserSignals,
+  PosterResponse,
+  ProbeSourceMessage,
+  RenderClipMessage,
+  SourceProbeMeta,
+  StartMessage,
+  WorkerEvent,
+  WorkerRequest,
+} from './protocol';
 import { BrowserTranscriber, ModelLoadError } from './transcribe';
+import { TranscriptionPool } from './transcribe-pool';
+import { fetchWithRetry } from './upload-retry';
 import { retrySection } from './section-retry';
+import { cleanupTranscriptWords, isWordOwnedByRange } from './transcript-cleanup';
 import { BrowserFfmpeg, isFfmpegCoreError } from './ffmpeg-core';
 import { buildClipRenderArgs } from './render-command';
 import { isJpeg } from '../poster';
@@ -48,6 +60,15 @@ interface ProcessorClip {
 
 let ffmpeg: BrowserFfmpeg | null = null;
 let transcriber: BrowserTranscriber | null = null;
+let transcriptionPool: TranscriptionPool | null = null;
+const profileMarks: Record<string, number> = {};
+const profile = {
+  audioExtractMs: 0,
+  transcribeBatchMs: 0,
+  poolFallbacks: 0,
+  uploadRetries: 0,
+  workers: 0,
+};
 let session: Session | null = null;
 let logs: string[] = [];
 let cancelled = false;
@@ -59,8 +80,106 @@ let currentClipNumber: number | null = null;
 
 function mark(label: string): void {
   const now = performance.now();
+  profileMarks[label] = now;
   console.info(`[ac-timing] ${label} ${Math.round(now - markAt)}ms (total ${Math.round(now - runStartedAt)}ms)`);
   markAt = now;
+}
+
+/**
+ * One machine-readable line at the end of a run. The UI never reads this; it
+ * exists so a real benchmark can report encode, verify, poster and upload time
+ * separately instead of guessing from the overall progress bar.
+ */
+function logProfile(): void {
+  const at = (label: string): number | undefined => profileMarks[label];
+  const span = (from: string, to: string): number | null => {
+    const start = at(from);
+    const end = at(to);
+    return start !== undefined && end !== undefined ? Math.round(end - start) : null;
+  };
+  const clipNumbers = [
+    ...new Set(
+      Object.keys(profileMarks)
+        .map((key) => /^clip-(\d+)-/.exec(key)?.[1])
+        .filter((value): value is string => Boolean(value))
+        .map(Number),
+    ),
+  ].sort((a, b) => a - b);
+  const clips = clipNumbers.map((clip) => {
+    const prefix = `clip-${clip}-`;
+    return {
+      clip,
+      setupMs: span(`${prefix}start`, `${prefix}core-ready`),
+      encodeMs: span(`${prefix}core-ready`, `${prefix}encoded`),
+      verifyMs: span(`${prefix}encoded`, `${prefix}verified`),
+      posterMs: span(`${prefix}verified`, `${prefix}poster`),
+      uploadMs: span(`${prefix}video-upload-start`, `${prefix}uploads-complete`),
+      finalizeMs: span(`${prefix}uploads-complete`, `${prefix}finalized`),
+      totalMs: span(`${prefix}start`, `${prefix}finalized`),
+    };
+  });
+  const summary = {
+    totalMs: Math.round(performance.now() - runStartedAt),
+    transcribeMs: span('source-probed', 'transcribed'),
+    selectionMs: span('transcribed', 'selection-ready'),
+    renderMs: span('selection-ready', 'complete'),
+    audioExtractMs: Math.round(profile.audioExtractMs),
+    transcribeBatchMs: Math.round(profile.transcribeBatchMs),
+    workers: profile.workers,
+    poolFallbacks: profile.poolFallbacks,
+    uploadRetries: profile.uploadRetries,
+    clips,
+  };
+  console.info(`[ac-profile] ${JSON.stringify(summary)}`);
+}
+
+function canRunParallelTranscription(): boolean {
+  const memory = Number(
+    (navigator as unknown as { deviceMemory?: number }).deviceMemory ?? 8,
+  );
+  const cores = Number(navigator.hardwareConcurrency ?? 4);
+  return memory >= 8 && cores >= 4;
+}
+
+async function ensureTranscriptionPool(
+  engine: 'auto' | 'wasm',
+  hooks: {
+    onModelProgress: (detail: string, fraction: number) => void;
+    onEngine: (engine: 'webgpu' | 'wasm', detail: string) => void;
+  },
+): Promise<TranscriptionPool | null> {
+  if (!canRunParallelTranscription()) return null;
+  if (transcriptionPool) return transcriptionPool;
+  const candidate = new TranscriptionPool({
+    size: 2,
+    forceWasm: engine === 'wasm',
+    hooks,
+  });
+  await candidate.load();
+  transcriptionPool = candidate;
+  console.info(
+    `[ac-timing] whisper-pool ready workers=${candidate.size} engines=${candidate.engines.join(',')}`,
+  );
+  return candidate;
+}
+
+async function loadSerialTranscriber(
+  engine: 'auto' | 'wasm',
+  onModel: (detail: string, fraction: number) => void,
+  onEngine: (engine: 'webgpu' | 'wasm', detail: string) => void,
+): Promise<BrowserTranscriber> {
+  const instance = transcriber ?? new BrowserTranscriber();
+  transcriber = instance;
+  await instance.load(
+    {
+      onModelProgress: onModel,
+      onEngine,
+      onProgress: () => undefined,
+    },
+    engine === 'wasm',
+  );
+  profile.workers = Math.max(1, profile.workers);
+  return instance;
 }
 
 function send(event: WorkerEvent) {
@@ -405,6 +524,45 @@ async function probe(_instance: BrowserFfmpeg) {
   };
 }
 
+async function runSourceProbe(message: ProbeSourceMessage): Promise<void> {
+  try {
+    const response = await fetch(`/api/projects/${message.projectId}/processor`, {
+      credentials: 'same-origin',
+    });
+    const data = (await response.json().catch(() => ({}))) as {
+      sourceMode?: 'local' | 'remote' | 'none';
+      sourceUrl: string | null;
+      sourceBytes: number | null;
+      error?: string;
+    };
+    if (!response.ok) throw new Error(data.error ?? `Could not load the project (HTTP ${response.status}).`);
+    if (data.sourceMode === 'local' && !message.sourceFile) {
+      throw new Error('This source is kept in your browser. Attach the original video on this device first.');
+    }
+    if (!message.sourceFile && !data.sourceUrl) {
+      throw new Error(data.error ?? 'This project has no source video.');
+    }
+
+    const instance = await loadFfmpeg();
+    await attachSource(instance, message.sourceFile, data.sourceUrl, data.sourceBytes, () => undefined);
+    const meta = await probe(instance);
+    if (!meta.hasAudio) {
+      throw new Error('This video has no audio track. AutoClipper needs speech to validate a transcript.');
+    }
+    const result: SourceProbeMeta = meta;
+    send({ type: 'source-probe', requestId: message.requestId, meta: result });
+  } catch (error) {
+    const code = isFfmpegCoreError(error) ? 'ffmpeg_wasm_core_crashed' : 'source_probe_failed';
+    const detail = error instanceof Error ? error.message : String(error);
+    send({
+      type: 'source-probe-error',
+      requestId: message.requestId,
+      code,
+      message: detail.slice(0, 1500) || 'The source video could not be inspected.',
+    });
+  }
+}
+
 async function extractAudioSegment(
   instance: BrowserFfmpeg,
   startMs: number,
@@ -725,42 +883,70 @@ async function uploadClip(projectId: string, clipId: string, index: number, vide
   edits: ClipEdits;
   effects: ClipEffects;
 }) {
-  mark(`clip-${index + 1}-video-upload-start`);
-  const videoResponse = await fetch(`/api/clips/${clipId}/upload?asset=video`, {
-    method: 'PUT',
-    credentials: 'same-origin',
-    headers: { 'content-type': 'video/mp4', 'x-file-size': String(video.byteLength) },
-    body: video as BodyInit,
+  const retry = (asset: 'video' | 'poster' | 'finalize') => ({
+    attempts: 4,
+    onRetry: (attempt: number, error: Error, delayMs: number) => {
+      profile.uploadRetries += 1;
+      console.warn(
+        `[ac-upload] clip ${index + 1} ${asset} attempt ${attempt} failed (${error.message.slice(0, 160)}); retrying in ${delayMs}ms`,
+      );
+    },
   });
+
+  mark(`clip-${index + 1}-video-upload-start`);
+  const videoRequest = fetchWithRetry(
+    `/api/clips/${clipId}/upload?asset=video`,
+    {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'video/mp4', 'x-file-size': String(video.byteLength) },
+      body: video as BodyInit,
+    },
+    retry('video'),
+  );
+  const posterRequest = fetchWithRetry(
+    `/api/clips/${clipId}/upload?asset=poster`,
+    {
+      method: 'PUT',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'image/jpeg', 'x-file-size': String(poster.byteLength) },
+      body: poster as BodyInit,
+    },
+    retry('poster'),
+  );
+
+  // The video is the large object; the poster is tiny. Sending them together
+  // removes a full round trip from every clip without changing either payload.
+  const [videoResponse, posterResponse] = await Promise.all([videoRequest, posterRequest]);
   if (!videoResponse.ok) {
     const data = (await videoResponse.json().catch(() => ({}))) as { error?: string };
     throw new Error(data.error ?? `Clip upload failed (HTTP ${videoResponse.status}).`);
   }
   mark(`clip-${index + 1}-video-uploaded`);
-  const posterResponse = await fetch(`/api/clips/${clipId}/upload?asset=poster`, {
-    method: 'PUT',
-    credentials: 'same-origin',
-    headers: { 'content-type': 'image/jpeg', 'x-file-size': String(poster.byteLength) },
-    body: poster as BodyInit,
-  });
   const posterData = (await posterResponse.json().catch(() => ({}))) as { error?: string; key?: string };
   if (!posterResponse.ok) {
     throw new Error(posterData.error ?? `Poster upload failed (HTTP ${posterResponse.status}).`);
   }
   mark(`clip-${index + 1}-poster-uploaded`);
-  const finalized = await fetch(`/api/clips/${clipId}/finalize`, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({
-      ...meta,
-      bytes: video.byteLength,
-      posterBytes: poster.byteLength,
-      hasPoster: true,
-      posterKey: posterData.key ?? null,
-      index,
-    }),
-  });
+  mark(`clip-${index + 1}-uploads-complete`);
+
+  const finalized = await fetchWithRetry(
+    `/api/clips/${clipId}/finalize`,
+    {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ...meta,
+        bytes: video.byteLength,
+        posterBytes: poster.byteLength,
+        hasPoster: true,
+        posterKey: posterData.key ?? null,
+        index,
+      }),
+    },
+    retry('finalize'),
+  );
   const data = (await finalized.json().catch(() => ({}))) as { clip?: ClipView; error?: string };
   if (!finalized.ok || !data.clip) {
     throw new Error(data.error ?? `Could not save the rendered clip (HTTP ${finalized.status}).`);
@@ -811,95 +997,186 @@ async function analyzeAudioSegments(
   const peaks: number[] = [];
   let language = savedTranscript?.language ?? 'en';
   let provider = savedTranscript?.provider ?? 'browser-whisper';
+  let estimatedTiming = savedTranscript?.timing === 'estimated';
   let activeTranscriber: BrowserTranscriber | null = null;
+  let pool: TranscriptionPool | null = null;
 
   if (!reusable) {
-    activeTranscriber = transcriber ?? new BrowserTranscriber();
-    transcriber = activeTranscriber;
-    const hooks = {
-      onModelProgress: onModel,
-      onEngine,
-      onProgress: (fraction: number, detail: string) => onProgress(fraction, detail),
-    };
-    await activeTranscriber.load(hooks, engine === 'wasm');
+    try {
+      pool = await ensureTranscriptionPool(engine, { onModelProgress: onModel, onEngine });
+      profile.workers = pool?.size ?? 0;
+    } catch (error) {
+      logs.push(
+        `Parallel transcription unavailable: ${(error as Error).message.slice(0, 240)}`,
+      );
+      profile.poolFallbacks += 1;
+      pool = null;
+    }
+    if (!pool) {
+      activeTranscriber = await loadSerialTranscriber(engine, onModel, onEngine);
+    }
   }
 
-  for (let index = 0; index < segmentCount; index += 1) {
-    const segmentStart = index * AUDIO_SEGMENT_MS;
-    const segmentEnd = Math.min(
-      meta.durationMs,
-      segmentStart + AUDIO_SEGMENT_MS + (index < segmentCount - 1 ? AUDIO_SEGMENT_OVERLAP_MS : 0),
-    );
-    if (segmentEnd <= segmentStart) continue;
-    onProgress(
-      index / segmentCount,
-      reusable
-        ? `Measuring audio section ${index + 1} of ${segmentCount}`
-        : `Transcribing audio section ${index + 1} of ${segmentCount}`,
-    );
-    const extractStartedAt = performance.now();
-    let audio: DecodedAudio | null = await retrySection(
-      () => extractAudioSegment(instance, segmentStart, segmentEnd),
-      {
-        label: `audio section ${index + 1}`,
-        onRetry: (_attempt, error) =>
-          onProgress(
-            index / segmentCount,
-            `Audio section ${index + 1} failed (${error.message.slice(0, 120)}); retrying once`,
-          ),
-      },
-    );
-    console.info(
-      `[ac-timing] audio-section-${index + 1} extract ${Math.round(performance.now() - extractStartedAt)}ms`,
-    );
-    const chunkSignals = signalsFromSamples(audio, [], segmentStart);
-    levels.push(...chunkSignals.audio);
-    peaks.push(...chunkSignals.peaksMs);
+  for (let index = 0; index < segmentCount; ) {
+    const batchSize = pool?.size ?? 1;
+    const batchEnd = Math.min(segmentCount, index + batchSize);
+    const batch: { index: number; startMs: number; endMs: number; audio: DecodedAudio }[] = [];
 
-    if (activeTranscriber) {
-      const active = activeTranscriber;
-      const sectionAudio = audio;
-      const transcribeStartedAt = performance.now();
-      const part = await retrySection(
-        () =>
-          active.transcribe(
-            sectionAudio,
-            {
-              onModelProgress: onModel,
-              onEngine,
-              onProgress: (fraction: number, detail: string) =>
-                onProgress((index + fraction) / segmentCount, detail),
-            },
-            segmentStart,
-          ),
+    for (let batchIndex = index; batchIndex < batchEnd; batchIndex += 1) {
+      const segmentStart = batchIndex * AUDIO_SEGMENT_MS;
+      const segmentEnd = Math.min(
+        meta.durationMs,
+        segmentStart + AUDIO_SEGMENT_MS + (batchIndex < segmentCount - 1 ? AUDIO_SEGMENT_OVERLAP_MS : 0),
+      );
+      if (segmentEnd <= segmentStart) continue;
+      onProgress(
+        batchIndex / segmentCount,
+        reusable
+          ? `Measuring audio section ${batchIndex + 1} of ${segmentCount}`
+          : pool
+            ? `Preparing audio section ${batchIndex + 1} of ${segmentCount} for ${pool.size} transcription workers`
+            : `Transcribing audio section ${batchIndex + 1} of ${segmentCount}`,
+      );
+      const extractStartedAt = performance.now();
+      const audio = await retrySection(
+        () => extractAudioSegment(instance, segmentStart, segmentEnd),
         {
-          label: `transcription section ${index + 1}`,
+          label: `audio section ${batchIndex + 1}`,
           onRetry: (_attempt, error) =>
             onProgress(
-              index / segmentCount,
-              `Transcription section ${index + 1} failed (${error.message.slice(0, 120)}); retrying once`,
+              batchIndex / segmentCount,
+              `Audio section ${batchIndex + 1} failed (${error.message.slice(0, 120)}); retrying once`,
             ),
         },
       );
+      profile.audioExtractMs += performance.now() - extractStartedAt;
       console.info(
-        `[ac-timing] audio-section-${index + 1} transcribe ${Math.round(performance.now() - transcribeStartedAt)}ms`,
+        `[ac-timing] audio-section-${batchIndex + 1} extract ${Math.round(performance.now() - extractStartedAt)}ms`,
       );
-      const skipBefore = index === 0 ? -1 : segmentStart + AUDIO_SEGMENT_OVERLAP_MS - 30;
-      for (const word of part.words) {
-        if (word.startMs < skipBefore) continue;
-        if (words.some((existing) => Math.abs(existing.startMs - word.startMs) < 40 && existing.text === word.text)) {
-          continue;
-        }
-        words.push(word);
-      }
-      if (part.text.trim()) textParts.push(part.text.trim());
-      language = part.language ?? language;
-      provider = part.provider;
+      const chunkSignals = signalsFromSamples(audio, [], segmentStart);
+      levels.push(...chunkSignals.audio);
+      peaks.push(...chunkSignals.peaksMs);
+      batch.push({ index: batchIndex, startMs: segmentStart, endMs: segmentEnd, audio });
     }
-    // Drop this section's PCM before extracting the next one. A full-length
-    // source never has all of its decoded audio alive at once.
-    audio = null;
-    onProgress((index + 1) / segmentCount, `Audio section ${index + 1} of ${segmentCount} complete`);
+
+    if (batch.length === 0) {
+      index = batchEnd;
+      continue;
+    }
+
+    if (!reusable) {
+      let parts: import('./protocol').BrowserTranscript[] | null = null;
+      const activePool = pool;
+      if (activePool) {
+        const active = new Map<number, number>();
+        const reportActive = (detail: string) => {
+          const total = [...active.values()].reduce((sum, value) => sum + value, 0);
+          onProgress((index + total) / segmentCount, detail);
+        };
+        const batchStartedAt = performance.now();
+        try {
+          parts = await Promise.all(
+            batch.map((item) =>
+              retrySection(
+                () =>
+                  activePool.transcribe(item.audio, item.startMs, (fraction, detail) => {
+                    active.set(item.index, Math.min(1, Math.max(0, fraction)));
+                    reportActive(detail);
+                  }),
+                {
+                  label: `transcription section ${item.index + 1}`,
+                  onRetry: (_attempt, error) =>
+                    onProgress(
+                      item.index / segmentCount,
+                      `Transcription section ${item.index + 1} failed (${error.message.slice(0, 120)}); retrying once`,
+                    ),
+                },
+              ).then((part) => {
+                active.set(item.index, 1);
+                reportActive(`Section ${item.index + 1} of ${segmentCount} transcribed`);
+                return part;
+              }),
+            ),
+          );
+          profile.transcribeBatchMs += performance.now() - batchStartedAt;
+          console.info(
+            `[ac-timing] transcribe-batch-${index + 1} ${Math.round(performance.now() - batchStartedAt)}ms (${batch.length} sections, ${activePool.size} workers)`,
+          );
+        } catch (error) {
+          logs.push(
+            `Parallel transcription failed (${(error as Error).message.slice(0, 240)}); retrying this batch serially`,
+          );
+          profile.poolFallbacks += 1;
+          activePool.dispose();
+          if (transcriptionPool === activePool) transcriptionPool = null;
+          pool = null;
+          parts = null;
+          activeTranscriber = await loadSerialTranscriber(engine, onModel, onEngine);
+        }
+      }
+
+      if (!parts) {
+        if (!activeTranscriber) {
+          activeTranscriber = await loadSerialTranscriber(engine, onModel, onEngine);
+        }
+        const serialParts: import('./protocol').BrowserTranscript[] = [];
+        for (const item of batch) {
+          const transcribeStartedAt = performance.now();
+          serialParts.push(
+            await retrySection(
+              () =>
+                activeTranscriber!.transcribe(
+                  item.audio,
+                  {
+                    onModelProgress: onModel,
+                    onEngine,
+                    onProgress: (fraction, detail) =>
+                      onProgress((item.index + fraction) / segmentCount, detail),
+                  },
+                  item.startMs,
+                ),
+              {
+                label: `transcription section ${item.index + 1}`,
+                onRetry: (_attempt, error) =>
+                  onProgress(
+                    item.index / segmentCount,
+                    `Transcription section ${item.index + 1} failed (${error.message.slice(0, 120)}); retrying once`,
+                  ),
+              },
+            ),
+          );
+          console.info(
+            `[ac-timing] audio-section-${item.index + 1} transcribe ${Math.round(performance.now() - transcribeStartedAt)}ms`,
+          );
+        }
+        parts = serialParts;
+      }
+
+      for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+        const item = batch[partIndex];
+        const part = parts[partIndex];
+        if (!item || !part) continue;
+        if (part.timing === 'estimated') estimatedTiming = true;
+        // Sections overlap by two seconds. The midpoint rule gives each word
+        // to exactly one section: no duplicated boundary word and no gap from
+        // dropping the whole overlap on both sides.
+        const skipBefore = item.index === 0 ? 0 : item.startMs + AUDIO_SEGMENT_OVERLAP_MS;
+        for (const word of part.words) {
+          if (isWordOwnedByRange(word, skipBefore, item.endMs)) words.push(word);
+        }
+        if (part.text.trim()) textParts.push(part.text.trim());
+        language = part.language ?? language;
+        provider = part.provider;
+      }
+    }
+
+    // The batch's PCM goes out of scope here; a full-length source never has
+    // all of its decoded audio alive at once.
+    index = batchEnd;
+    onProgress(
+      index / segmentCount,
+      `Audio section ${Math.min(index, segmentCount)} of ${segmentCount} complete`,
+    );
   }
 
   if (reusable) {
@@ -910,15 +1187,26 @@ async function analyzeAudioSegments(
     throw new Error('No speech was detected in this video. AutoClipper will not invent a transcript.');
   }
   words.sort((a, b) => a.startMs - b.startMs);
+  const cleaned = reusable ? null : cleanupTranscriptWords(words);
+  const finalWords = cleaned?.words ?? words;
+  if (finalWords.length === 0) {
+    throw new Error('No speech was detected in this video. AutoClipper will not invent a transcript.');
+  }
+  if (cleaned) {
+    console.info(
+      `[ac-transcript] ${cleaned.stats.inputWords}→${cleaned.stats.outputWords} words · placeholdersRemoved=${cleaned.stats.placeholdersRemoved} · repeatRuns=${cleaned.stats.repeatedRuns} · repeatWordsRemoved=${cleaned.stats.repeatedWordsRemoved} · denseRuns=${cleaned.stats.denseRuns} · denseWordsRemoved=${cleaned.stats.denseWordsRemoved}` +
+        (cleaned.stats.examples.length > 0 ? ` · examples=${JSON.stringify(cleaned.stats.examples)}` : ''),
+    );
+  }
   const transcript: import('./protocol').BrowserTranscript = reusable
     ? savedTranscript!
     : {
         provider,
         language,
-        timing: 'provider',
-        text: textParts.join(' ').trim() || words.map((word) => word.text).join(' '),
-        words,
-        segments: segmentsFromWords(words),
+        timing: estimatedTiming ? 'estimated' : 'provider',
+        text: cleaned?.text || textParts.join(' ').trim() || finalWords.map((word) => word.text).join(' '),
+        words: finalWords,
+        segments: segmentsFromWords(finalWords),
       };
   peaks.sort((a, b) => a - b);
   return {
@@ -946,6 +1234,17 @@ async function runStart(message: StartMessage) {
   runStartedAt = performance.now();
   markAt = runStartedAt;
   currentClipNumber = null;
+  for (const key of Object.keys(profileMarks)) delete profileMarks[key];
+  profileMarks['run-start'] = runStartedAt;
+  profile.audioExtractMs = 0;
+  profile.transcribeBatchMs = 0;
+  profile.poolFallbacks = 0;
+  profile.uploadRetries = 0;
+  profile.workers = 0;
+  if (transcriptionPool && transcriptionPool.size === 0) {
+    transcriptionPool.dispose();
+    transcriptionPool = null;
+  }
   let currentStage: PipelineStage = 'probe';
   try {
     await report(projectId, 'probe', 0.02, 'Preparing browser processor');
@@ -997,10 +1296,9 @@ async function runStart(message: StartMessage) {
     let signals: BrowserSignals;
     let savedClips: ProcessorClip[];
 
-    if (reusableTranscript) {
-      // A retry must not re-extract 27 minutes of audio just to recreate the
-      // signals. The saved transcript and the existing clip selection are the
-      // durable state; resume directly at the first unfinished clip.
+    if (reusableTranscript && existingClips.length > 0) {
+      // Resuming a run with saved clips must not re-extract 27 minutes of audio
+      // just to recreate signals. The transcript and selection are durable.
       transcript = data.transcript as import('./protocol').BrowserTranscript;
       signals = EMPTY_SIGNALS;
       savedClips = existingClips;
@@ -1012,6 +1310,37 @@ async function runStart(message: StartMessage) {
         `Saved transcript reused (${transcript.words.length} words); no audio re-analysis needed`,
       );
       mark('transcript-reused');
+    } else if (reusableTranscript) {
+      // A manually uploaded transcript (or a transcript saved before selection)
+      // skips Whisper, but still measures the source audio. Audio peaks and
+      // levels are inputs to the existing selector, so dropping them would
+      // weaken clip selection and caption pacing.
+      currentStage = 'transcribe';
+      await report(projectId, 'transcribe', 0, 'Preparing audio signals for the saved transcript');
+      const analysis = await analyzeAudioSegments(
+        instance,
+        meta,
+        data.transcript,
+        message.engine,
+        (fraction, detail) => void report(projectId, 'transcribe', fraction, detail),
+        (detail, fraction) => {
+          send({ type: 'model', detail, progress: Math.round(fraction * 100) });
+          void report(projectId, 'transcribe', fraction * 0.05, detail);
+        },
+        (engine, detail) => send({ type: 'engine', engine, detail }),
+      );
+      transcript = analysis.transcript;
+      signals = analysis.signals;
+      savedClips = [];
+      send({ type: 'transcript', wordCount: transcript.words.length, language: transcript.language });
+      await report(
+        projectId,
+        'transcribe',
+        1,
+        `Transcript loaded (${transcript.words.length} words); Whisper inference skipped`,
+      );
+      mark('transcript-reused');
+      session = hydrateSession(projectId, meta, signals, transcript);
     } else {
       currentStage = 'transcribe';
       await report(projectId, 'audio', 1, 'Transcribing audio in bounded sections');
@@ -1097,6 +1426,7 @@ async function runStart(message: StartMessage) {
       const saved = savedClips[index];
       if (saved.status === 'rendered') continue;
       currentClipNumber = saved.index + 1;
+      mark(`clip-${currentClipNumber}-start`);
 
       // Start every clip from a clean wasm core. A 27-minute source exercises
       // enough decoder/filter state that a single long-lived core can trap
@@ -1182,8 +1512,9 @@ async function runStart(message: StartMessage) {
     const completed = (await post(`/api/projects/${projectId}/process`, { action: 'complete' })) as {
       project?: import('../types').Project;
     };
-    send({ type: 'done', project: completed.project as import('../types').Project });
     mark('complete');
+    logProfile();
+    send({ type: 'done', project: completed.project as import('../types').Project });
   } catch (error) {
     const failureStage = error instanceof ModelLoadError ? 'transcribe' : currentStage;
     const elapsed = ((performance.now() - runStartedAt) / 1000).toFixed(1);
@@ -1194,6 +1525,7 @@ async function runStart(message: StartMessage) {
       0,
       1500,
     );
+    logProfile();
     try {
       await post(`/api/projects/${projectId}/process`, {
         action: 'fail',
@@ -1301,6 +1633,8 @@ self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const message = event.data;
   if (message.type === 'poster-response') {
     resolvePosterResponse(message);
+  } else if (message.type === 'probe-source') {
+    void runSourceProbe(message);
   } else if (message.type === 'start') {
     void runStart(message);
   } else if (message.type === 'render-clip') {

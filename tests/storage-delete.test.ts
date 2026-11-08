@@ -170,3 +170,59 @@ test('deleteProject explicitly removes the project transcript, clips and jobs', 
   assert.equal(db.getClips(projectId).length, 0);
   assert.equal(db.getLatestJob(projectId), null);
 });
+
+test('a restart reset discards the saved transcript even when no clips exist', () => {
+  const projectId = randomUUID();
+  db.createProject({ id: projectId, ownerId: ALICE, title: 'Restart transcript', sourceKind: 'upload' });
+  db.saveTranscript(projectId, {
+    text: 'old words',
+    language: 'en',
+    timing: 'provider',
+    provider: 'test',
+    words: [{ text: 'old', startMs: 0, endMs: 400 }],
+    segments: [{ text: 'old words', startMs: 0, endMs: 500 }],
+  });
+  db.updateProject(projectId, { status: 'completed', stage: 'done', progress: 100 });
+
+  db.resetProjectForRun(projectId);
+
+  assert.equal(db.getTranscript(projectId), null);
+  assert.equal(db.getProject(projectId)?.status, 'queued');
+});
+
+test('a pool-backed production host deletes a local-first project without an R2 binding', async () => {
+  const projectId = randomUUID();
+  db.createProject({ id: projectId, ownerId: ALICE, title: 'Pool delete', sourceKind: 'upload' });
+
+  const saved: Record<string, string | undefined> = {};
+  const poolEnv: Record<string, string> = {
+    NODE_ENV: 'production',
+    AC_B2_ENDPOINT: 'https://s3.example.test',
+    AC_B2_REGION: 'test-region',
+    AC_B2_BUCKET: 'test-bucket',
+    AC_B2_ACCESS_KEY_ID: 'test-access',
+    AC_B2_SECRET_ACCESS_KEY: 'test-secret',
+  };
+  for (const key of Object.keys(poolEnv)) saved[key] = process.env[key];
+  Object.assign(process.env, poolEnv);
+
+  try {
+    // The project directory holds only a browser-side local source; nothing was
+    // uploaded to a provider, so deletion must not need the legacy R2 binding.
+    const dirs = await ensureProjectDirs(projectId);
+    await writeFile(path.join(dirs.source, 'input.mp4'), 1_234);
+
+    const result = await deleteProjectFiles(projectId);
+
+    assert.equal(result.verified, true);
+    assert.equal(result.failedFiles.length, 0);
+    assert.equal(result.bytesFreed, 1_234);
+    assert.equal(fs.existsSync(dirs.base), false);
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    db.deleteProject(projectId);
+  }
+});

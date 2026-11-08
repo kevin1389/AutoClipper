@@ -1860,9 +1860,12 @@ export function workerIsOnline(maxAgeMs = 30_000): boolean {
   return Date.now() - new Date(String(row.heartbeat_at)).getTime() < maxAgeMs;
 }
 
-/** Clears render results so a failed or finished project can run again. */
+/** Clears render results and the saved transcript so a project can run again from scratch. */
 export function resetProjectForRun(projectId: string): void {
   getDb().prepare('DELETE FROM clips WHERE project_id = ?').run(projectId);
+  // Re-run must retranscribe. Keeping the old transcript made a restart silently
+  // reuse the previous run's words and skip the model entirely.
+  getDb().prepare('DELETE FROM transcripts WHERE project_id = ?').run(projectId);
   updateProject(projectId, {
     status: 'queued',
     stage: 'queued',

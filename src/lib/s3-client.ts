@@ -332,7 +332,18 @@ export async function s3HeadObject(
 ): Promise<{ size: number; etag: string | null; contentType: string | null } | null> {
   const response = await request(config, 'HEAD', key);
   if (response.status === 404) return null;
-  if (!response.ok) throw await responseError(response, 'Object check');
+  if (!response.ok) {
+    const error = await responseError(response, 'Object check');
+    if (response.status === 403) {
+      throw new S3Error(
+        `${error.message} The provider denied the HEAD request; check its read/download cap and key permissions.`,
+        error.status,
+        error.code,
+        error.requestId,
+      );
+    }
+    throw error;
+  }
   return {
     size: Number(response.headers.get('content-length') ?? 0) || 0,
     etag: response.headers.get('etag')?.replace(/^"|"$/g, '') ?? null,

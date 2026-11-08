@@ -72,7 +72,9 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     }
     const existingClips = await db.getClips(id);
     const restart = body.restart === true;
-    if (restart && existingClips.length > 0) await db.resetProjectForRun(id);
+    // Reset even when no clips exist: a run can have failed after saving a
+    // transcript but before selection, and Re-run must not reuse those words.
+    if (restart) await db.resetProjectForRun(id);
     const keptClips = restart ? [] : existingClips;
     const rendered = keptClips.filter((clip) => clip.status === 'rendered').length;
     await db.updateProject(id, {
@@ -84,6 +86,24 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
           ? `Resuming with ${rendered} of ${keptClips.length} clips already rendered`
           : 'Starting browser processor',
       error: null,
+    });
+    return Response.json({ ok: true, project: await db.getProjectForOwner(id, auth.user.id) });
+  }
+
+  if (action === 'probe') {
+    const meta = (body.meta ?? {}) as Record<string, unknown>;
+    const durationMs = Math.round(Number(meta.durationMs));
+    if (!Number.isFinite(durationMs) || durationMs <= 0) {
+      return jsonError(400, 'invalid_video_metadata', 'The source video duration could not be verified.');
+    }
+    const width = Math.round(Number(meta.width));
+    const height = Math.round(Number(meta.height));
+    const fps = Number(meta.fps);
+    await db.updateProject(id, {
+      durationMs,
+      width: Number.isFinite(width) && width > 0 ? width : null,
+      height: Number.isFinite(height) && height > 0 ? height : null,
+      fps: Number.isFinite(fps) && fps > 0 ? fps : null,
     });
     return Response.json({ ok: true, project: await db.getProjectForOwner(id, auth.user.id) });
   }
@@ -115,10 +135,16 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     const words = validWords(body.transcript && (body.transcript as Record<string, unknown>).words);
     const segments = validSegments(body.transcript && (body.transcript as Record<string, unknown>).segments);
     if (words.length === 0) return jsonError(400, 'empty_transcript', 'No word-level transcript was supplied.');
+    // A segment-level Whisper response is expanded in the browser; persist that
+    // honestly instead of always claiming provider-precise word timing.
+    const timing: 'provider' | 'estimated' =
+      (body.transcript as Record<string, unknown> | undefined)?.timing === 'estimated'
+        ? 'estimated'
+        : 'provider';
     const transcript: Transcript = {
       provider: cleanText((body.transcript as Record<string, unknown>)?.provider, 200) || 'browser-whisper',
       language: cleanText((body.transcript as Record<string, unknown>)?.language, 30) || null,
-      timing: 'provider',
+      timing,
       text: cleanText((body.transcript as Record<string, unknown>)?.text, 500_000),
       words,
       segments,
@@ -128,7 +154,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
     await db.updateProject(id, {
       language: transcript.language,
       transcriptionProvider: transcript.provider,
-      timingSource: 'provider',
+      timingSource: timing,
       durationMs: Number.isFinite(Number(meta.durationMs)) ? Math.round(Number(meta.durationMs)) : undefined,
       width: Number.isFinite(Number(meta.width)) ? Math.round(Number(meta.width)) : undefined,
       height: Number.isFinite(Number(meta.height)) ? Math.round(Number(meta.height)) : undefined,

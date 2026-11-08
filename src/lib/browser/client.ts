@@ -1,7 +1,14 @@
 'use client';
 
 import type { ClipEdits, ClipView } from '../types';
-import type { PosterRequest, PosterResponse, RenderClipMessage, WorkerEvent } from './protocol';
+import type {
+  PosterRequest,
+  PosterResponse,
+  ProbeSourceMessage,
+  RenderClipMessage,
+  SourceProbeMeta,
+  WorkerEvent,
+} from './protocol';
 import { capturePosterFromVideo } from './poster-capture';
 
 type EventHandler = (event: WorkerEvent) => void;
@@ -16,6 +23,11 @@ export class BrowserProcessorClient {
   private renderResolve: ((clip: ClipView) => void) | null = null;
   private renderReject: ((error: Error) => void) | null = null;
   private sourceFile: File | null = null;
+  private probeWaiters = new Map<
+    string,
+    { resolve: (meta: SourceProbeMeta) => void; reject: (error: Error) => void }
+  >();
+  private probeCounter = 0;
 
   constructor(handler: EventHandler) {
     this.handler = handler;
@@ -30,12 +42,25 @@ export class BrowserProcessorClient {
         void this.respondWithPoster(message);
         return;
       }
+      if (message.type === 'source-probe') {
+        const waiter = this.probeWaiters.get(message.requestId);
+        this.probeWaiters.delete(message.requestId);
+        waiter?.resolve(message.meta);
+        return;
+      }
+      if (message.type === 'source-probe-error') {
+        const waiter = this.probeWaiters.get(message.requestId);
+        this.probeWaiters.delete(message.requestId);
+        waiter?.reject(new Error(message.message));
+        return;
+      }
       if (message.type === 'render-done') {
         this.renderResolve?.(message.clip);
         this.renderResolve = null;
         this.renderReject = null;
       } else if (message.type === 'error') {
         const error = new Error(message.message);
+        this.rejectProbes(error);
         this.renderReject?.(error);
         this.renderResolve = null;
         this.renderReject = null;
@@ -46,6 +71,7 @@ export class BrowserProcessorClient {
     };
     worker.onerror = (event) => {
       const error = new Error(event.message || 'The browser processing worker crashed.');
+      this.rejectProbes(error);
       this.renderReject?.(error);
       this.renderResolve = null;
       this.renderReject = null;
@@ -84,6 +110,26 @@ export class BrowserProcessorClient {
     this.ensureWorker().postMessage({ type: 'start', projectId, engine, sourceFile });
   }
 
+  probeSource(projectId: string, sourceFile: File | null): Promise<SourceProbeMeta> {
+    const worker = this.ensureWorker();
+    const requestId = `probe-${Date.now()}-${this.probeCounter++}`;
+    return new Promise<SourceProbeMeta>((resolve, reject) => {
+      this.probeWaiters.set(requestId, { resolve, reject });
+      const message: ProbeSourceMessage = {
+        type: 'probe-source',
+        requestId,
+        projectId,
+        sourceFile,
+      };
+      worker.postMessage(message);
+    });
+  }
+
+  private rejectProbes(error: Error): void {
+    for (const waiter of this.probeWaiters.values()) waiter.reject(error);
+    this.probeWaiters.clear();
+  }
+
   renderClip(
     projectId: string,
     clip: { id: string; index: number; title: string; startMs: number; endMs: number },
@@ -110,6 +156,7 @@ export class BrowserProcessorClient {
   }
 
   cancel(): void {
+    this.rejectProbes(new Error('Processing was cancelled.'));
     this.renderReject?.(new Error('Processing was cancelled.'));
     this.renderResolve = null;
     this.renderReject = null;

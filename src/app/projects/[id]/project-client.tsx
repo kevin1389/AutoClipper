@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ClipCard } from '@/components/clip-card';
 import { DeleteProjectDialog } from '@/components/delete-project-dialog';
+import { ManualTranscriptDialog } from '@/components/manual-transcript-dialog';
 import { ProgressTimeline } from '@/components/progress-timeline';
 import { StatusPill } from '@/components/status-pill';
 import { Logo } from '@/components/logo';
@@ -13,7 +14,9 @@ import { deleteLocalSource, loadLocalSource, saveLocalSource } from '@/lib/local
 import { ACCEPT_ATTRIBUTE, MAX_SOURCE_BYTES, isAllowedExtension } from '@/lib/upload-limits';
 import { BrowserProcessorClient } from '@/lib/browser/client';
 import type { WorkerEvent } from '@/lib/browser/protocol';
-import type { ClipEdits, ClipView, PipelineStage, ProjectView } from '@/lib/types';
+import type { ClipEdits, ClipView, PipelineStage, ProjectView, Transcript } from '@/lib/types';
+
+type SourceProbeState = 'idle' | 'probing' | 'ready' | 'error';
 
 export function ProjectClient({ initialView }: { initialView: ProjectView }) {
   const router = useRouter();
@@ -21,6 +24,7 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
   const [actionError, setActionError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showTranscript, setShowTranscript] = useState(false);
+  const [manualTranscriptOpen, setManualTranscriptOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [processingHere, setProcessingHere] = useState(false);
   const [engineDetail, setEngineDetail] = useState<string | null>(null);
@@ -31,10 +35,15 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
   const [localSourceState, setLocalSourceState] = useState<'remote' | 'loading' | 'ready' | 'missing'>(
     initialView.sourceMode === 'local' ? 'loading' : 'remote',
   );
+  const [sourceProbeState, setSourceProbeState] = useState<SourceProbeState>(
+    initialView.project.durationMs && initialView.project.durationMs > 0 ? 'ready' : 'idle',
+  );
+  const [sourceProbeError, setSourceProbeError] = useState<string | null>(null);
   const processorRef = useRef<BrowserProcessorClient | null>(null);
+  const sourceProbeClientRef = useRef<BrowserProcessorClient | null>(null);
+  const sourceProbeRef = useRef<Promise<number | null> | null>(null);
   const localInputRef = useRef<HTMLInputElement>(null);
   const rerenderRef = useRef(false);
-  const autoStartedRef = useRef(false);
 
   const { project } = view;
   const active = project.status === 'queued' || project.status === 'processing';
@@ -144,7 +153,17 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
     return processorRef.current;
   }, [handleWorkerEvent]);
 
-  useEffect(() => () => processorRef.current?.cancel(), []);
+  useEffect(() => () => {
+    processorRef.current?.cancel();
+    sourceProbeClientRef.current?.cancel();
+  }, []);
+
+  useEffect(() => {
+    if (project.durationMs && project.durationMs > 0) {
+      setSourceProbeState('ready');
+      setSourceProbeError(null);
+    }
+  }, [project.durationMs]);
 
   // Live updates over SSE, with polling as a fallback.
   useEffect(() => {
@@ -174,7 +193,11 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
     return () => clearInterval(timer);
   }, [active, applyView, project.id]);
 
-  const startProcessing = async (force: boolean, restart = false) => {
+  const startProcessing = async (
+    force: boolean,
+    restart = false,
+    manualTranscript?: Transcript,
+  ) => {
     if (view.sourceMode === 'local' && !localFile) {
       setActionError('Attach the original video on this device before processing. The source never left your browser.');
       return;
@@ -195,6 +218,37 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
         throw new Error(data.error ?? `Could not start processing (HTTP ${response.status})`);
       }
       const data = (await response.json()) as { project: ProjectView['project'] };
+      if (manualTranscript) {
+        const saved = await fetch(`/api/projects/${project.id}/process`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            action: 'transcript',
+            transcript: manualTranscript,
+            meta: {
+              durationMs: data.project.durationMs,
+              width: data.project.width,
+              height: data.project.height,
+              fps: data.project.fps,
+            },
+          }),
+        });
+        if (!saved.ok) {
+          const saveError = (await saved.json().catch(() => ({}))) as { error?: string };
+          await fetch(`/api/projects/${project.id}/process`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              action: 'fail',
+              stage: 'transcribe',
+              error: saveError.error ?? 'The uploaded transcript could not be saved.',
+            }),
+          }).catch(() => undefined);
+          throw new Error(
+            saveError.error ?? `The uploaded transcript could not be saved (HTTP ${saved.status}).`,
+          );
+        }
+      }
       setView((previous) => ({
         ...previous,
         project: data.project,
@@ -213,17 +267,79 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
     }
   };
 
-  // A freshly uploaded project is processed automatically when it opens. The
-  // ref makes StrictMode's double effect (and ordinary re-renders) harmless.
-  useEffect(() => {
-    if (autoStartedRef.current) return;
-    if (project.status !== 'ready') return;
-    if (view.sourceMode === 'local' && localSourceState !== 'ready') return;
-    autoStartedRef.current = true;
-    void startProcessing(false);
-    // startProcessing intentionally runs once for the ready transition.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project.status, project.id, view.sourceMode, localSourceState]);
+  const ensureSourceMetadata = useCallback(async (): Promise<number | null> => {
+    if (project.durationMs && project.durationMs > 0) {
+      setSourceProbeState('ready');
+      setSourceProbeError(null);
+      return project.durationMs;
+    }
+    if (sourceProbeRef.current) return sourceProbeRef.current;
+    if (view.sourceMode === 'none') {
+      setSourceProbeState('error');
+      setSourceProbeError('This project has no source video to inspect.');
+      return null;
+    }
+    if (view.sourceMode === 'local' && localSourceState !== 'ready') {
+      setSourceProbeState('error');
+      setSourceProbeError(
+        localSourceState === 'loading'
+          ? 'The local source is still loading in this browser. Try again in a moment.'
+          : 'Attach the original video on this device before uploading a transcript.',
+      );
+      return null;
+    }
+
+    setSourceProbeState('probing');
+    setSourceProbeError(null);
+    const pending = (async () => {
+      const client = new BrowserProcessorClient(() => undefined);
+      sourceProbeClientRef.current = client;
+      try {
+        const meta = await client.probeSource(
+          project.id,
+          view.sourceMode === 'local' ? localFile : null,
+        );
+        const response = await fetch(`/api/projects/${project.id}/process`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action: 'probe', meta }),
+        });
+        const data = (await response.json().catch(() => ({}))) as {
+          project?: ProjectView['project'];
+          error?: string;
+        };
+        if (!response.ok || !data.project) {
+          throw new Error(data.error ?? `Could not save the video duration (HTTP ${response.status}).`);
+        }
+        setView((previous) => ({ ...previous, project: data.project as ProjectView['project'] }));
+        setSourceProbeState('ready');
+        return data.project.durationMs ?? meta.durationMs;
+      } catch (error) {
+        setSourceProbeState('error');
+        setSourceProbeError(
+          error instanceof Error ? error.message : 'The source video could not be inspected.',
+        );
+        return null;
+      } finally {
+        sourceProbeClientRef.current = null;
+        client.cancel();
+        sourceProbeRef.current = null;
+      }
+    })();
+    sourceProbeRef.current = pending;
+    return pending;
+  }, [localFile, localSourceState, project.durationMs, project.id, view.sourceMode]);
+
+  const openManualTranscript = () => {
+    setActionError(null);
+    setManualTranscriptOpen(true);
+    void ensureSourceMetadata();
+  };
+
+  const startWithManualTranscript = (transcript: Transcript) => {
+    setManualTranscriptOpen(false);
+    void startProcessing(true, true, transcript);
+  };
 
   const rerenderClip = async (clip: ClipView, edits: ClipEdits): Promise<ClipView> => {
     rerenderRef.current = true;
@@ -329,9 +445,18 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
             </div>
           </div>
 
-          <div className="flex shrink-0 flex-wrap items-center gap-2">
-            {view.downloadAllUrl && (
-              <a href={view.downloadAllUrl} className="btn-primary text-xs" download>
+          <div className="flex shrink-0 flex-wrap items-center gap-2">              {!active && (project.status === 'failed' || project.status === 'completed') && (
+                <button
+                  type="button"
+                  className="btn-secondary text-xs"
+                  onClick={openManualTranscript}
+                  disabled={busy || (view.sourceMode === 'local' && localSourceState !== 'ready')}
+                >
+                  Upload transcript
+                </button>
+              )}
+              {view.downloadAllUrl && (
+                <a href={view.downloadAllUrl} className="btn-primary text-xs" download>
                 <svg viewBox="0 0 16 16" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.7">
                   <path d="M8 2.5v7m0 0L5 6.6M8 9.5l3-2.9M3 12.5h10" strokeLinecap="round" strokeLinejoin="round" />
                 </svg>
@@ -480,7 +605,9 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
                       </>
                     ) : null}
                     <p className="mt-2 text-[11px] leading-relaxed text-mist-500">
-                      {modelDetail ?? 'FFmpeg.wasm and Whisper run in a Web Worker; this tab must stay open.'}
+                      {modelDetail ?? (view.transcript?.provider.startsWith('manual-')
+                        ? 'Manual transcript loaded. FFmpeg.wasm is extracting audio signals and rendering in a Web Worker; Whisper is skipped.'
+                        : 'FFmpeg.wasm and Whisper run in a Web Worker; this tab must stay open.')}
                     </p>
                   </div>
                 )}
@@ -491,18 +618,28 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
               <section className="panel p-5 sm:p-6">
                 <h2 className="text-sm font-semibold text-white">Ready to clip</h2>
                 <p className="mt-1.5 text-sm leading-relaxed text-mist-400">
-                  The source is ready on this device. Processing starts automatically: your browser mounts
-                  the local file, transcribes it in sections, selects the strongest moments and renders 9:16
-                  clips with captions. The original is not uploaded to remote storage.
+                  Choose automatic transcription with the local Whisper model, or upload an existing
+                  SRT, VTT, or TXT transcript to skip transcription. The source stays on this device,
+                  and the strongest moments are selected and rendered as 9:16 captioned clips.
                 </p>
-                <button
-                  type="button"
-                  className="btn-primary mt-4 text-xs"
-                  onClick={() => void startProcessing(false)}
-                  disabled={busy}
-                >
-                  {busy ? 'Starting…' : 'Start processing'}
-                </button>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    className="btn-primary text-xs"
+                    onClick={() => void startProcessing(false)}
+                    disabled={busy || (view.sourceMode === 'local' && localSourceState !== 'ready')}
+                  >
+                    {busy ? 'Starting…' : 'Start automatic transcription'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary text-xs"
+                    onClick={openManualTranscript}
+                    disabled={busy || (view.sourceMode === 'local' && localSourceState !== 'ready')}
+                  >
+                    Upload transcript
+                  </button>
+                </div>
               </section>
             )}
 
@@ -560,13 +697,25 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
                       {view.transcript.timing === 'estimated' ? 'estimated word timing' : 'word-level timing'}
                     </p>
                   </div>
-                  <button
-                    type="button"
-                    className="btn-ghost text-xs"
-                    onClick={() => setShowTranscript((value) => !value)}
-                  >
-                    {showTranscript ? 'Hide' : 'Show'}
-                  </button>
+                  <div className="flex flex-wrap items-center gap-1">
+                    {!active && (
+                      <button
+                        type="button"
+                        className="btn-ghost text-xs"
+                        onClick={openManualTranscript}
+                        disabled={busy || (view.sourceMode === 'local' && localSourceState !== 'ready')}
+                      >
+                        Replace transcript
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="btn-ghost text-xs"
+                      onClick={() => setShowTranscript((value) => !value)}
+                    >
+                      {showTranscript ? 'Hide' : 'Show'}
+                    </button>
+                  </div>
                 </div>
                 {showTranscript && (
                   <p className="mt-4 max-h-80 overflow-y-auto whitespace-pre-wrap rounded-xl border border-ink-700 bg-ink-950 p-3 text-[13px] leading-relaxed text-mist-300">
@@ -611,6 +760,19 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
           </aside>
         </div>
       </main>
+
+      {manualTranscriptOpen && (
+        <ManualTranscriptDialog
+          durationMs={project.durationMs}
+          sourceProbeState={project.durationMs ? 'ready' : sourceProbeState}
+          sourceProbeError={sourceProbeError}
+          renderedClipCount={renderedClips.length}
+          busy={busy}
+          onRetrySourceProbe={() => void ensureSourceMetadata()}
+          onCancel={() => setManualTranscriptOpen(false)}
+          onStart={startWithManualTranscript}
+        />
+      )}
 
       {deleteOpen && (
         <DeleteProjectDialog

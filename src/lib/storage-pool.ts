@@ -19,6 +19,7 @@ import {
   s3ListObjects,
   s3PutObject,
   s3UploadPart,
+  S3Error,
   type S3Config,
   type S3Part,
 } from './s3-client';
@@ -378,11 +379,30 @@ async function releaseObjectReservation(objectId: string): Promise<void> {
   await db.releaseActiveReservationsForObject(objectId).catch(() => undefined);
 }
 
+/**
+ * Confirms an object is absent. A provider may deny HEAD (for example, B2's
+ * Class B download cap) while LIST remains available, so fall back to an exact
+ * key listing before deciding that bytes may still exist.
+ */
+async function objectAbsent(provider: StorageProviderConfig, key: string): Promise<boolean> {
+  try {
+    return !(await s3HeadObject(s3Config(provider), key));
+  } catch (error) {
+    if (!(error instanceof S3Error) || error.status !== 403) return false;
+    try {
+      const listing = await s3ListObjects(s3Config(provider), key);
+      return !listing.objects.some((entry) => entry.key === key);
+    } catch {
+      return false;
+    }
+  }
+}
+
 /** Returns true only after deletion is confirmed absent. */
 async function discardObject(provider: StorageProviderConfig, key: string): Promise<boolean> {
   try {
     await s3DeleteObject(s3Config(provider), key);
-    return !(await s3HeadObject(s3Config(provider), key));
+    return await objectAbsent(provider, key);
   } catch {
     return false;
   }
@@ -976,8 +996,9 @@ async function removeObject(record: StorageObjectRecord): Promise<{
   await db.updateStorageObject(record.id, { status: 'deleting', lastError: null }).catch(() => undefined);
   try {
     await s3DeleteObject(s3Config(provider), record.key);
-    const head = await s3HeadObject(s3Config(provider), record.key);
-    if (head) throw new Error('The object is still present after deletion.');
+    if (!(await objectAbsent(provider, record.key))) {
+      throw new Error('The object is still present after deletion.');
+    }
     await db.deleteStorageObject(record.id);
     measurementCache.delete(measurementKey(provider));
     return { ok: true, bytes: record.bytes, error: null };

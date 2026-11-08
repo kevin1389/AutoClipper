@@ -40,12 +40,36 @@ export function decodeWav(bytes: Uint8Array): DecodedAudio {
 
   const frames = Math.floor(dataLength / (2 * channels));
   const samples = new Float32Array(frames);
-  for (let frame = 0; frame < frames; frame += 1) {
-    let mixed = 0;
-    for (let channel = 0; channel < channels; channel += 1) {
-      mixed += view.getInt16(dataOffset + (frame * channels + channel) * 2, true) / 32768;
+  // WAV PCM is little-endian, which matches every browser platform this app
+  // supports. Use a typed view instead of a DataView call per sample; 5-minute
+  // sections contain 4.8 million samples, so the difference is measurable.
+  const aligned = (bytes.byteOffset + dataOffset) % 2 === 0;
+  const pcm = aligned
+    ? new Int16Array(
+        bytes.buffer,
+        bytes.byteOffset + dataOffset,
+        Math.min(frames * channels, Math.floor((view.byteLength - dataOffset) / 2)),
+      )
+    : null;
+  if (channels === 1) {
+    if (pcm) {
+      for (let frame = 0; frame < frames; frame += 1) samples[frame] = pcm[frame] / 32768;
+    } else {
+      for (let frame = 0; frame < frames; frame += 1) {
+        samples[frame] = view.getInt16(dataOffset + frame * 2, true) / 32768;
+      }
     }
-    samples[frame] = mixed / channels;
+  } else {
+    for (let frame = 0; frame < frames; frame += 1) {
+      let mixed = 0;
+      for (let channel = 0; channel < channels; channel += 1) {
+        const sample = pcm
+          ? pcm[frame * channels + channel]
+          : view.getInt16(dataOffset + (frame * channels + channel) * 2, true);
+        mixed += sample / 32768;
+      }
+      samples[frame] = mixed / channels;
+    }
   }
 
   return { sampleRate, samples, durationMs: Math.round((frames / sampleRate) * 1000) };

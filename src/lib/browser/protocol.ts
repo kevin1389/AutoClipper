@@ -48,6 +48,22 @@ export interface StartMessage {
   sourceFile?: File | null;
 }
 
+export interface ProbeSourceMessage {
+  type: 'probe-source';
+  requestId: string;
+  projectId: string;
+  /** Required when the project's source is browser-local. */
+  sourceFile?: File | null;
+}
+
+export interface SourceProbeMeta {
+  durationMs: number;
+  width: number;
+  height: number;
+  fps: number | null;
+  hasAudio: boolean;
+}
+
 export interface RenderClipMessage {
   type: 'render-clip';
   projectId: string;
@@ -77,7 +93,7 @@ export interface PosterResponse {
   error?: string;
 }
 
-export type WorkerRequest = StartMessage | RenderClipMessage | PosterResponse;
+export type WorkerRequest = StartMessage | ProbeSourceMessage | RenderClipMessage | PosterResponse;
 
 export type WorkerEvent =
   | { type: 'progress'; stage: BrowserStage; progress: number; detail: string }
@@ -89,6 +105,8 @@ export type WorkerEvent =
   | { type: 'clip'; clip: ClipView }
   | { type: 'done'; project: Project }
   | { type: 'render-done'; clip: ClipView }
+  | { type: 'source-probe'; requestId: string; meta: SourceProbeMeta }
+  | { type: 'source-probe-error'; requestId: string; message: string; code: string }
   | PosterRequest
   | { type: 'error'; message: string; code: string };
 

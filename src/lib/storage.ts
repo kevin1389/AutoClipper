@@ -92,6 +92,20 @@ async function filesBinding(): Promise<R2Bucket | null> {
   }
 }
 
+/**
+ * Binding lookup that tolerates a host without R2. It is only used when the S3
+ * provider pool is configured, because that deployment never writes to R2.
+ */
+async function optionalFilesBinding(): Promise<R2Bucket | null> {
+  try {
+    const { getCloudflareContext } = await import('@opennextjs/cloudflare');
+    const env = getCloudflareContext().env as { FILES?: R2Bucket };
+    return env.FILES ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function isBlobKey(target: string): boolean {
   return target.startsWith(BLOB_PREFIX);
 }
@@ -152,7 +166,10 @@ export function projectDirs(id: string) {
 
 export async function ensureProjectDirs(id: string): Promise<ReturnType<typeof projectDirs>> {
   assertSafeId(id);
-  if (await filesBinding()) {
+  // The S3 provider pool is a separate object backend. Project directories are
+  // local scratch space and must not require a legacy R2 binding when the pool
+  // is configured (notably on a production `next start` host).
+  if (!storagePoolConfigured() && (await filesBinding())) {
     const base = projectBlobBase(id);
     return {
       base,
@@ -426,11 +443,19 @@ export async function deleteProjectFiles(
   bucketOverride?: R2Bucket | null,
 ): Promise<ProjectFileDeletion> {
   assertSafeId(id);
-  const bucket = bucketOverride === undefined ? await filesBinding() : bucketOverride;
-  const legacy = bucket ? await deleteR2ProjectFiles(bucket, id) : await deleteLocalProjectFiles(id);
   // The injected-bucket test path is legacy-only and intentionally does not
   // need a database/provider pool.
-  if (bucketOverride !== undefined) return legacy;
+  if (bucketOverride !== undefined) {
+    return bucketOverride
+      ? await deleteR2ProjectFiles(bucketOverride, id)
+      : await deleteLocalProjectFiles(id);
+  }
+
+  // With the S3 provider pool configured, uploads never use the legacy R2
+  // binding, so a production host without that binding must still be able to
+  // delete a project. Legacy R2 objects are removed when the binding exists.
+  const bucket = storagePoolConfigured() ? await optionalFilesBinding() : await filesBinding();
+  const legacy = bucket ? await deleteR2ProjectFiles(bucket, id) : await deleteLocalProjectFiles(id);
 
   const pooled = await deletePoolProjectObjects(id);
   const verified = legacy.verified && pooled.verified;

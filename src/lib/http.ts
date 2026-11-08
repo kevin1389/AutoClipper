@@ -13,6 +13,23 @@ export function jsonError(
   return Response.json({ error: message, code, ...extra }, { status });
 }
 
+/**
+ * Converts an unexpected route failure into a JSON response that names the
+ * actual cause. Without this, Next.js serves an HTML 500 and the browser falls
+ * back to a generic "Request failed (HTTP 500)" message.
+ */
+export function unexpectedErrorResponse(
+  error: unknown,
+  code: string,
+  prefix: string,
+  status = 500,
+): Response {
+  const raw = error instanceof Error ? error.message : String(error);
+  const detail = raw.replace(/\s+/g, ' ').trim();
+  const message = detail ? `${prefix}: ${detail.slice(0, 400)}` : prefix;
+  return jsonError(status, code, message);
+}
+
 function parseRange(header: string, size: number): { start: number; end: number } | null {
   const match = /^bytes=(\d*)-(\d*)$/.exec(header.trim());
   if (!match) return null;

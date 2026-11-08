@@ -427,8 +427,8 @@ export function DashboardClient({
                     {uploading ? 'Preparing…' : 'Open project and process'}
                   </button>
                   <p className="text-center text-[11px] leading-relaxed text-mist-500">
-                    The original stays on this device. Processing starts automatically when the project
-                    opens in this browser tab.
+                    The original stays on this device. Choose automatic transcription or upload an
+                    existing transcript when the project opens in this browser tab.
                   </p>
                   {file && !uploading && (
                     <button
@@ -983,9 +983,9 @@ export function DashboardClient({
 
         <p className="mt-6 text-xs leading-relaxed text-mist-500">
           Processing uses FFmpeg.wasm and a quantized Whisper model in this tab. The model downloads
-          once and is cached by the browser; a ready project processes automatically when opened,
-          closing the tab pauses work, and the project page can resume it. No separate processing
-          server is required.
+          once and is cached by the browser; a ready project waits for you to choose automatic
+          transcription or upload a transcript, closing the tab pauses work, and the project page
+          can resume it. No separate processing server is required.
         </p>
       </main>
 

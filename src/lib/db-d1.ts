@@ -1549,6 +1549,8 @@ export async function workerIsOnline(maxAgeMs = 30_000): Promise<boolean> {
 
 export async function resetProjectForRun(projectId: string): Promise<void> {
   await d1().prepare('DELETE FROM clips WHERE project_id = ?').bind(projectId).run();
+  // A restart must not silently reuse the previous run's transcript.
+  await d1().prepare('DELETE FROM transcripts WHERE project_id = ?').bind(projectId).run();
   await updateProject(projectId, {
     status: 'queued',
     stage: 'queued',
