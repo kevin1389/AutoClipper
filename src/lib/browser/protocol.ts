@@ -46,6 +46,8 @@ export interface StartMessage {
   engine: 'auto' | 'wasm';
   /** Present on the local-first path. Never serialized to the server. */
   sourceFile?: File | null;
+  /** Public FFmpeg/ONNX/Whisper/font base; defaults to same-origin assets. */
+  assetBaseUrl?: string;
 }
 
 export interface ProbeSourceMessage {
@@ -54,6 +56,7 @@ export interface ProbeSourceMessage {
   projectId: string;
   /** Required when the project's source is browser-local. */
   sourceFile?: File | null;
+  assetBaseUrl?: string;
 }
 
 export interface SourceProbeMeta {
@@ -75,6 +78,7 @@ export interface RenderClipMessage {
   edits: ClipEdits;
   /** Required when the project's source is browser-local. */
   sourceFile?: File | null;
+  assetBaseUrl?: string;
   selected?: SelectedClip | null;
 }
 

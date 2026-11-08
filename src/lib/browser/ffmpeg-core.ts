@@ -12,6 +12,8 @@
  * instance unhealthy so the processor can dispose it, mount the source on a
  * fresh core and retry instead of reusing corrupted state.
  */
+import { browserAssetSpec } from '../browser-assets';
+import { browserAssetUrl } from './asset-base';
 
 export interface FfmpegCore {
   loaded: boolean;
@@ -101,11 +103,40 @@ export class BrowserFfmpeg {
 
   async load(): Promise<void> {
     if (this.loaded && this.core) return;
-    const origin = self.location.origin;
-    const response = await fetch(`${origin}/ffmpeg/ffmpeg-core.wasm`);
-    if (!response.ok) throw new Error(`Could not load FFmpeg.wasm (HTTP ${response.status}).`);
-    const wasmBinary = await response.arrayBuffer();
-    const module = await loadModule(`${origin}/ffmpeg/ffmpeg-core.js`);
+    const wasmSpec = browserAssetSpec('ffmpeg/ffmpeg-core.wasm');
+    const scriptSpec = browserAssetSpec('ffmpeg/ffmpeg-core.js');
+    if (!wasmSpec || !scriptSpec) {
+      throw new Error('The browser asset manifest is missing the FFmpeg.wasm core files.');
+    }
+    const wasmUrl = browserAssetUrl(wasmSpec.path);
+    const scriptUrl = browserAssetUrl(scriptSpec.path);
+
+    let wasmBinary: ArrayBuffer;
+    try {
+      const response = await fetch(wasmUrl);
+      if (!response.ok) throw new Error(`HTTP ${response.status} from ${wasmUrl}`);
+      wasmBinary = await response.arrayBuffer();
+    } catch (cause) {
+      throw new Error(
+        `Could not load the FFmpeg.wasm core from ${wasmUrl}. The asset host must allow CORS and serve the file, or BROWSER_ASSET_BASE_URL is misconfigured.`,
+        { cause },
+      );
+    }
+    if (wasmBinary.byteLength !== wasmSpec.bytes) {
+      throw new Error(
+        `The FFmpeg.wasm core was incomplete: expected ${wasmSpec.bytes} bytes but received ${wasmBinary.byteLength} from ${wasmUrl}.`,
+      );
+    }
+
+    let module: { default: CoreFactory };
+    try {
+      module = await loadModule(scriptUrl);
+    } catch (cause) {
+      throw new Error(
+        `Loaded ffmpeg-core.wasm but could not import the FFmpeg core module from ${scriptUrl}. The host must serve JavaScript with a JavaScript content type and allow CORS.`,
+        { cause },
+      );
+    }
     const core = await module.default({ wasmBinary });
     core.setLogger((entry) => {
       for (const handler of this.logHandlers) handler(entry);

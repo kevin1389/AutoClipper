@@ -18,7 +18,13 @@ import type { ClipEdits, ClipView, PipelineStage, ProjectView, Transcript } from
 
 type SourceProbeState = 'idle' | 'probing' | 'ready' | 'error';
 
-export function ProjectClient({ initialView }: { initialView: ProjectView }) {
+export function ProjectClient({
+  initialView,
+  assetBaseUrl,
+}: {
+  initialView: ProjectView;
+  assetBaseUrl: string;
+}) {
   const router = useRouter();
   const [view, setView] = useState<ProjectView>(initialView);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -148,10 +154,10 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
 
   const ensureProcessor = useCallback(() => {
     if (!processorRef.current) {
-      processorRef.current = new BrowserProcessorClient(handleWorkerEvent);
+      processorRef.current = new BrowserProcessorClient(handleWorkerEvent, assetBaseUrl);
     }
     return processorRef.current;
-  }, [handleWorkerEvent]);
+  }, [assetBaseUrl, handleWorkerEvent]);
 
   useEffect(() => () => {
     processorRef.current?.cancel();
@@ -257,7 +263,7 @@ export function ProjectClient({ initialView }: { initialView: ProjectView }) {
       setProcessingHere(true);
       setBusy(false);
       processorRef.current?.cancel();
-      const processor = new BrowserProcessorClient(handleWorkerEvent);
+      const processor = new BrowserProcessorClient(handleWorkerEvent, assetBaseUrl);
       processorRef.current = processor;
       processor.start(project.id, 'auto', localFile);
     } catch (error) {

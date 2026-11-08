@@ -4,7 +4,6 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import * as db from '../src/lib/db';
@@ -22,7 +21,7 @@ import {
 } from '../src/lib/storage-pool';
 import { deleteProjectFiles, getBlob, getStorageUsage, pathExists } from '../src/lib/storage';
 import { fileResponse } from '../src/lib/http';
-import { appendStorageFile } from '../src/lib/zip-storage';
+import { appendStorageFile, createZipStream } from '../src/lib/zip-storage';
 import { createMockS3, type MockS3 } from './support/mock-s3';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoclipper-pool-'));
@@ -402,37 +401,33 @@ test('remote ranges, downloads and ZIP exports stream provider objects', async (
     assert.equal((await new Response(downloaded.body).arrayBuffer()).byteLength, expectedSize);
   }
 
-  const nodeRequire = createRequire(path.join(process.cwd(), 'package.json'));
-  interface ZipArchive {
-    pipe(destination: NodeJS.WritableStream): void;
-    file(filePath: string, data: { name: string }): void;
-    append(content: string | NodeJS.ReadableStream, data: { name: string }): void;
-    finalize(): Promise<void>;
-    on(event: string, listener: (...args: unknown[]) => void): void;
-  }
-  const archiverModule = nodeRequire('archiver') as {
-    ZipArchive?: new (options?: { zlib?: { level?: number } }) => ZipArchive;
-    default?: (format: 'zip', options?: { zlib?: { level?: number } }) => ZipArchive;
-  };
-  const archive: ZipArchive =
-    typeof archiverModule.ZipArchive === 'function'
-      ? new archiverModule.ZipArchive({ zlib: { level: 0 } })
-      : (archiverModule.default as NonNullable<typeof archiverModule.default>)('zip', {
-          zlib: { level: 0 },
-        });
+  const archive = createZipStream();
   const zipPath = path.join(dataDir, 'clips.zip');
-  const output = fs.createWriteStream(zipPath);
-  archive.pipe(output);
+  const zipChunks: Uint8Array[] = [];
+  // Keep a consumer attached: the ZIP writer intentionally waits for the
+  // response stream's backpressure before reading the next entry.
+  const collected = (async () => {
+    const reader = archive.stream.getReader();
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) zipChunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  })();
   assert.equal(await appendStorageFile(archive, remotePath, 'clip.mp4'), true);
   assert.equal(await appendStorageFile(archive, tigrisPath, 'tigris.mp4'), true);
   assert.equal(await appendStorageFile(archive, filebasePath, 'filebase.mp4'), true);
-  archive.append('{"project":"download"}', { name: 'clips.json' });
+  await archive.append('clips.json', '{"project":"download"}');
   await archive.finalize();
-  await new Promise<void>((resolve, reject) => {
-    output.on('close', resolve);
-    output.on('error', reject);
-  });
+  await collected;
+  fs.writeFileSync(zipPath, Buffer.concat(zipChunks));
 
+  const zipTest = spawnSync('unzip', ['-t', zipPath]);
+  assert.equal(zipTest.status, 0, zipTest.stderr?.toString());
   const unzip = spawnSync('unzip', ['-p', zipPath, 'clip.mp4']);
   assert.equal(unzip.status, 0, unzip.stderr?.toString());
   assert.deepEqual(unzip.stdout, Buffer.from(data));
@@ -442,6 +437,9 @@ test('remote ranges, downloads and ZIP exports stream provider objects', async (
   const unzipFilebase = spawnSync('unzip', ['-p', zipPath, 'filebase.mp4']);
   assert.equal(unzipFilebase.status, 0, unzipFilebase.stderr?.toString());
   assert.deepEqual(unzipFilebase.stdout, Buffer.from(filebaseData));
+  const manifest = spawnSync('unzip', ['-p', zipPath, 'clips.json']);
+  assert.equal(manifest.status, 0, manifest.stderr?.toString());
+  assert.equal(manifest.stdout.toString(), '{"project":"download"}');
 });
 
 test('a provider read outage is storage_unavailable, never a false file_not_found', async () => {

@@ -11,10 +11,11 @@
  * checked, downloaded with byte progress, and stored in a versioned Cache
  * Storage bucket so a retry does not restart completed files.
  */
+import { browserAssetUrl } from './asset-base';
 
 export const WHISPER_MODEL_ID = 'Xenova/whisper-tiny.en';
 export const WHISPER_MODEL_REVISION = '79fb389fc764e7c395bd330e9531d9d32ada7049';
-export const WHISPER_MODEL_ROOT = `/models/${WHISPER_MODEL_ID}`;
+export const WHISPER_MODEL_ROOT = `models/${WHISPER_MODEL_ID}`;
 
 const CACHE_NAME = `autoclipper-whisper-${WHISPER_MODEL_REVISION.slice(0, 8)}-v1`;
 
@@ -77,7 +78,7 @@ let openCachePromise: Promise<Cache | null> | null = null;
 let prunedCaches = false;
 
 function assetUrl(file: string): string {
-  return new URL(`${WHISPER_MODEL_ROOT}/${file}`, self.location.origin).href;
+  return browserAssetUrl(`${WHISPER_MODEL_ROOT}/${file}`);
 }
 
 function requestUrl(request: RequestInfo | URL): string {
@@ -243,7 +244,7 @@ export async function preloadWhisperAssets(
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw new WhisperAssetError(
-        `Could not reach ${asset.file} from AutoClipper (${detail}). The model file is served by this app, so this is a server or network failure, not a Hugging Face CDN failure.`,
+        `Could not reach ${asset.file} from the browser-asset host (${detail}). Check BROWSER_ASSET_BASE_URL, the bucket's CORS rules and the network, then retry.`,
         asset.file,
         { cause: error },
       );
@@ -251,7 +252,7 @@ export async function preloadWhisperAssets(
 
     if (!response.ok) {
       throw new WhisperAssetError(
-        `The model file ${asset.file} returned HTTP ${response.status} from AutoClipper.`,
+        `The model file ${asset.file} returned HTTP ${response.status} from the browser-asset host.`,
         asset.file,
       );
     }

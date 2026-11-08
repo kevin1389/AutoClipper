@@ -13,9 +13,9 @@ const extraDevOrigins = (process.env.AC_ALLOWED_DEV_ORIGINS ?? '')
   .filter(Boolean);
 
 const nextConfig: NextConfig = {
-  // FFmpeg binaries, ffprobe and archiver are native/CJS packages that must not be
-  // bundled by the server compiler.
-  serverExternalPackages: ['ffmpeg-static', '@ffprobe-installer/ffprobe', 'archiver'],
+  // FFmpeg and ffprobe are native packages that must not be bundled by the
+  // server compiler. ZIP generation uses fflate, which is safe to bundle.
+  serverExternalPackages: ['ffmpeg-static', '@ffprobe-installer/ffprobe'],
   // The caption font has to ship with the server build so libass can find it at runtime.
   outputFileTracingIncludes: {
     '/api/**': ['./assets/fonts/**'],
@@ -23,9 +23,16 @@ const nextConfig: NextConfig = {
   },
   // Local Whisper's virtualenv and model cache are runtime state, not server
   // code: the venv's python is a symlink to a system interpreter and the model
-  // cache is hundreds of MB. Tracing them fails the build, so keep them out.
+  // cache is hundreds of MB. Browser assets are uploaded to object storage or
+  // served from R2/disk at runtime, so tracing them would only bloat the Worker.
   outputFileTracingExcludes: {
-    '/**': ['./.venv-whisper/**', './.whisper-models/**', './data/**', './.smoke/**'],
+    '/**': [
+      './.venv-whisper/**',
+      './.whisper-models/**',
+      './data/**',
+      './.smoke/**',
+      './browser-assets/**',
+    ],
   },
   // Development only: ignored by `next build` / `next start`.
   allowedDevOrigins: ['*.style.dev', ...extraDevOrigins],

@@ -59,9 +59,20 @@ npm install
 npm run dev        # http://localhost:3000
 ```
 
-`npm run dev` and `npm run build` run `prepare:browser`, which copies the FFmpeg core, ONNX Runtime WASM and the caption font into `public/`. The pinned Whisper Tiny assets are served from `public/models/Xenova/whisper-tiny.en/`; the app never downloads them from Hugging Face at runtime. The first transcription downloads the 44.5 MB WASM set (or the larger WebGPU set) from the app origin into versioned Cache Storage and reuses completed files. The project UI shows byte progress, and a failed download offers **Retry model download** without requiring another video upload.
+`npm run dev` and `npm run build` run `prepare:browser`, which copies the FFmpeg core, ONNX Runtime WASM and the caption font into `browser-assets/`. Those files and the pinned Whisper Tiny model are served from `BROWSER_ASSET_BASE_URL` — the same-origin `/api/browser-assets` route by default — never from the Worker bundle and never from Hugging Face at runtime. The first transcription downloads the 44.5 MB WASM set (or the larger WebGPU set) into versioned Cache Storage and reuses completed files. The project UI shows byte progress, and a failed download offers **Retry model download** without requiring another video upload.
 
 No `.env` is required for local use. There is no `setup:whisper`, no `npm run worker`, and no system FFmpeg/Python dependency.
+
+### Browser asset hosting
+
+The asset set is deliberately outside `public/`: Cloudflare rejects any static asset above 25 MiB. By default the browser loads it from `/api/browser-assets/...`, which reads the R2 `FILES` binding (or `browser-assets/` from disk during local development). For a public bucket/CDN, upload once and point the app at it:
+
+```bash
+npm run assets:upload -- --provider b2 --prefix browser-assets/v1 --upload
+# BROWSER_ASSET_BASE_URL=https://f004.backblazeb2.com/file/ac-browser-assets/browser-assets/v1/
+```
+
+Dry-run is the default; add `--upload` to write. The bucket must allow public `GET`/`HEAD` with the CORS rules in `scripts/browser-assets-cors.json`. The deployed Worker needs only the public base URL, not storage credentials. B2 is the free default; Tigris public buckets require payment-method verification and Filebase public buckets require a paid plan, so check current terms before choosing them. Uploads use a one-year immutable cache under the versioned prefix, so bump `v1` in both `--prefix` and `BROWSER_ASSET_BASE_URL` whenever asset contents or the manifest change. For the default same-origin R2 route, store objects at `browser-assets/<manifest path>` without the `v1` segment; that route resolves the exact manifest paths, while the versioned prefix is for an external public base.
 
 ## Processing pipeline
 
@@ -87,7 +98,7 @@ The tab must stay open while processing. Progress is persisted; closing the tab 
 
 ## Transcript and captions
 
-`Xenova/whisper-tiny.en` is the Transformers.js reference model exported with cross-attentions, which is required for provider word timestamps. The `onnx-community` export was tried and correctly failed rather than fabricating timings. Captions are ASS files with per-word karaoke timing and the DejaVu Sans Bold font copied into `public/fonts`.
+`Xenova/whisper-tiny.en` is the Transformers.js reference model exported with cross-attentions, which is required for provider word timestamps. The `onnx-community` export was tried and correctly failed rather than fabricating timings. Captions are ASS files with per-word karaoke timing and the DejaVu Sans Bold font served from `browser-assets/fonts/`.
 
 The verified browser run (WASM fallback) produced:
 

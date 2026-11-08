@@ -1,5 +1,6 @@
 import { notFound, redirect } from 'next/navigation';
 import { getCurrentUser } from '@/lib/auth';
+import { publicConfig } from '@/lib/env';
 import { buildProjectView } from '@/lib/project-view';
 import { ProjectClient } from './project-client';
 
@@ -11,5 +12,10 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
   if (!user) redirect(`/login?next=${encodeURIComponent(`/projects/${id}`)}`);
   const view = await buildProjectView(id, user.id);
   if (!view) notFound();
-  return <ProjectClient initialView={view} />;
+  return (
+    <ProjectClient
+      initialView={view}
+      assetBaseUrl={publicConfig().browser.assetBaseUrl}
+    />
+  );
 }

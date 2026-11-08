@@ -27,6 +27,8 @@ import { buildClipRenderArgs } from './render-command';
 import { isJpeg } from '../poster';
 import { progressFor } from '../stages';
 import { MAX_SOURCE_BYTES } from '../upload-limits';
+import { browserAssetSpec } from '../browser-assets';
+import { browserAssetUrl, currentBrowserAssetBase, setBrowserAssetBase } from './asset-base';
 
 const SOURCE_PATH = '/source/input.mp4';
 /** Audio is extracted and transcribed in bounded sections for long sources. */
@@ -154,6 +156,7 @@ async function ensureTranscriptionPool(
     size: 2,
     forceWasm: engine === 'wasm',
     hooks,
+    assetBaseUrl: currentBrowserAssetBase(),
   });
   await candidate.load();
   transcriptionPool = candidate;
@@ -449,9 +452,19 @@ async function ensureFfmpegFiles() {
   } catch {
     // already exists
   }
-  const font = await fetch(`${self.location.origin}/fonts/DejaVuSans-Bold.ttf`);
-  if (!font.ok) throw new Error('The caption font could not be loaded.');
-  await instance.writeFile(FONT_PATH, new Uint8Array(await font.arrayBuffer()));
+  const fontUrl = browserAssetUrl('fonts/DejaVuSans-Bold.ttf');
+  const fontSpec = browserAssetSpec('fonts/DejaVuSans-Bold.ttf');
+  const font = await fetch(fontUrl);
+  if (!font.ok) {
+    throw new Error(`The caption font could not be loaded from ${new URL(fontUrl).host} (HTTP ${font.status}).`);
+  }
+  const fontBytes = new Uint8Array(await font.arrayBuffer());
+  if (fontSpec && fontBytes.byteLength !== fontSpec.bytes) {
+    throw new Error(
+      `The caption font was incomplete: expected ${fontSpec.bytes} bytes but received ${fontBytes.byteLength}.`,
+    );
+  }
+  await instance.writeFile(FONT_PATH, fontBytes);
   // Caption ASS files are written just before a render. Restore them if a
   // wasm trap forces the retry onto a fresh core.
   for (const [path, data] of volatileFiles) {
@@ -1631,6 +1644,9 @@ async function runRenderClip(message: RenderClipMessage) {
 
 self.onmessage = (event: MessageEvent<WorkerRequest>) => {
   const message = event.data;
+  if ('assetBaseUrl' in message && message.assetBaseUrl) {
+    setBrowserAssetBase(message.assetBaseUrl);
+  }
   if (message.type === 'poster-response') {
     resolvePosterResponse(message);
   } else if (message.type === 'probe-source') {

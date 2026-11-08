@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import type { PublicConfig } from './public-config';
 import { ACCEPT_ATTRIBUTE, ALLOWED_EXTENSIONS, MAX_SOURCE_BYTES } from './upload-limits';
+import { normalizeBrowserAssetBase } from './browser-assets';
 import {
   AUTHORIZED_DIRECTORY_PROVIDER,
   automaticAccessReason,
@@ -346,6 +347,7 @@ export function publicConfig(): PublicConfig {
       model: 'Xenova/whisper-tiny.en (quantized)',
       maxSourceBytes: browserLimit,
       webgpu: 'auto',
+      assetBaseUrl: normalizeBrowserAssetBase(process.env.BROWSER_ASSET_BASE_URL),
     },
     transcription: {
       configured: true,

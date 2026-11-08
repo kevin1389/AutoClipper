@@ -23,10 +23,11 @@ export interface TranscriptionPoolOptions {
   size: number;
   forceWasm: boolean;
   hooks: TranscriptionPoolHooks;
+  assetBaseUrl?: string;
 }
 
 type PoolRequest =
-  | { type: 'init'; forceWasm: boolean }
+  | { type: 'init'; forceWasm: boolean; assetBaseUrl?: string }
   | {
       type: 'transcribe';
       id: number;
@@ -78,6 +79,7 @@ export class TranscriptionPool {
   private readonly requestedSize: number;
   private readonly forceWasm: boolean;
   private readonly hooks: TranscriptionPoolHooks;
+  private readonly assetBaseUrl?: string;
   private slots: Slot[] = [];
   private queue: Task[] = [];
   private nextId = 1;
@@ -87,6 +89,7 @@ export class TranscriptionPool {
     this.requestedSize = Math.max(1, Math.floor(options.size));
     this.forceWasm = options.forceWasm;
     this.hooks = options.hooks;
+    this.assetBaseUrl = options.assetBaseUrl;
   }
 
   /** Number of workers that actually initialized. */
@@ -300,7 +303,11 @@ export class TranscriptionPool {
         fail(new TranscriptionPoolError(event.message || `Whisper worker ${index + 1} crashed.`));
       };
 
-      const request: PoolRequest = { type: 'init', forceWasm: this.forceWasm };
+      const request: PoolRequest = {
+        type: 'init',
+        forceWasm: this.forceWasm,
+        assetBaseUrl: this.assetBaseUrl,
+      };
       worker.postMessage(request);
     });
   }

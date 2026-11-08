@@ -37,6 +37,8 @@ export interface PublicConfig {
     model: string;
     maxSourceBytes: number;
     webgpu: 'auto';
+    /** Public FFmpeg/ONNX/Whisper/font base, normalized with a trailing slash. */
+    assetBaseUrl: string;
   };
   maxUploadBytes: number;
   uploads: {

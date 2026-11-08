@@ -24,11 +24,12 @@ data/
 .smoke/
 artifacts/
 
-# Generated browser assets (npm run prepare:browser copies them before dev/build)
-public/ffmpeg/
-public/transformers/
-public/fonts/
-public/browser-assets.json
+# Generated browser assets (npm run prepare:browser copies them before dev/build).
+# browser-assets/models/ is checked in; the rest is reproducible from packages.
+browser-assets/ffmpeg/
+browser-assets/transformers/
+browser-assets/fonts/
+browser-assets/browser-assets.json
 
 # Legacy local Faster-Whisper state (not used by the browser pipeline)
 .venv-whisper/

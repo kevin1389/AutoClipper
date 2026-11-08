@@ -14,10 +14,10 @@ import {
 import {
   WHISPER_MODEL_ID,
   WHISPER_MODEL_REVISION,
-  WHISPER_MODEL_ROOT,
   preloadWhisperAssets,
   whisperAssetCache,
 } from './whisper-assets';
+import { browserAssetDirectoryUrl } from './asset-base';
 
 // Xenova/whisper-tiny.en is the Transformers.js reference model documented for
 // return_timestamps: 'word'. The onnx-community export omits cross-attentions,
@@ -70,18 +70,18 @@ async function canUseWebGpu(): Promise<boolean> {
 
 function configureModelLoader(): void {
   if (typeof env.backends.onnx.wasm === 'object') {
-    env.backends.onnx.wasm.wasmPaths = new URL('/transformers/', self.location.origin).href;
+    env.backends.onnx.wasm.wasmPaths = browserAssetDirectoryUrl('transformers/');
     // The app does not require COOP/COEP headers. Keep inference single-threaded
     // so SharedArrayBuffer availability cannot break the WASM fallback.
     env.backends.onnx.wasm.numThreads = 1;
   }
   // Never make model loading depend on a third-party CDN. These assets are
-  // pinned and served from the same origin as the application.
+  // pinned and served from the configured browser-asset host.
   env.allowLocalModels = true;
   env.allowRemoteModels = false;
   // Transformers.js appends the model ID (`Xenova/whisper-tiny.en`) itself.
-  // The root must therefore be `/models/`, not the model's directory.
-  env.localModelPath = '/models/';
+  // The root must therefore be `models/`, not the model's directory.
+  env.localModelPath = browserAssetDirectoryUrl('models/');
   env.useBrowserCache = false;
   env.useCustomCache = true;
   env.customCache = whisperAssetCache;
@@ -408,7 +408,7 @@ export class BrowserTranscriber {
     );
     const segments: TranscriptSegment[] = segmentsFromWords(cleaned.words);
     return {
-      provider: `transformers.js ${MODEL_ID} (${this.engine}, same-origin)`,
+      provider: `transformers.js ${MODEL_ID} (${this.engine}, asset-host)`,
       language,
       timing: estimatedTiming ? 'estimated' : 'provider',
       text: cleaned.text,

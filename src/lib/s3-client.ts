@@ -263,11 +263,14 @@ async function request(
     body?: BodyInit | null;
     contentType?: string;
     contentLength?: number | null;
+    /** Immutable cache metadata for public browser assets. */
+    cacheControl?: string;
     range?: { offset: number; length: number };
   } = {},
 ): Promise<Response> {
   const headers: Record<string, string> = {};
   if (options.contentType) headers['content-type'] = options.contentType;
+  if (options.cacheControl) headers['cache-control'] = options.cacheControl;
   if (options.contentLength !== null && options.contentLength !== undefined) {
     headers['content-length'] = String(options.contentLength);
   }
@@ -377,6 +380,7 @@ export async function s3PutObject(
   maxBytes: number,
   contentType: string,
   expectedBytes: number | null,
+  cacheControl?: string,
 ): Promise<{ bytes: number; etag: string | null }> {
   if (expectedBytes !== null && expectedBytes > maxBytes) throw new Error('UPLOAD_TOO_LARGE');
 
@@ -410,6 +414,7 @@ export async function s3PutObject(
     body: uploadBody,
     contentType,
     contentLength,
+    cacheControl,
   });
   if (!response.ok) throw await responseError(response, 'Object upload');
   if (expectedBytes !== null && received !== expectedBytes) {

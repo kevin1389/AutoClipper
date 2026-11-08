@@ -10,6 +10,7 @@ import type {
   WorkerEvent,
 } from './protocol';
 import { capturePosterFromVideo } from './poster-capture';
+import { DEFAULT_BROWSER_ASSET_BASE } from '../browser-assets';
 
 type EventHandler = (event: WorkerEvent) => void;
 
@@ -29,7 +30,10 @@ export class BrowserProcessorClient {
   >();
   private probeCounter = 0;
 
-  constructor(handler: EventHandler) {
+  constructor(
+    handler: EventHandler,
+    private readonly assetBaseUrl: string = DEFAULT_BROWSER_ASSET_BASE,
+  ) {
     this.handler = handler;
   }
 
@@ -107,7 +111,13 @@ export class BrowserProcessorClient {
 
   start(projectId: string, engine: 'auto' | 'wasm' = 'auto', sourceFile: File | null = null): void {
     this.sourceFile = sourceFile;
-    this.ensureWorker().postMessage({ type: 'start', projectId, engine, sourceFile });
+    this.ensureWorker().postMessage({
+      type: 'start',
+      projectId,
+      engine,
+      sourceFile,
+      assetBaseUrl: this.assetBaseUrl,
+    });
   }
 
   probeSource(projectId: string, sourceFile: File | null): Promise<SourceProbeMeta> {
@@ -120,6 +130,7 @@ export class BrowserProcessorClient {
         requestId,
         projectId,
         sourceFile,
+        assetBaseUrl: this.assetBaseUrl,
       };
       worker.postMessage(message);
     });
@@ -150,6 +161,7 @@ export class BrowserProcessorClient {
         endMs: edits.endMs,
         edits,
         sourceFile,
+        assetBaseUrl: this.assetBaseUrl,
       };
       worker.postMessage(message);
     });

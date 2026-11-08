@@ -2,6 +2,7 @@
 import type { DecodedAudio } from './audio';
 import type { BrowserTranscript } from './protocol';
 import { BrowserTranscriber } from './transcribe';
+import { setBrowserAssetBase } from './asset-base';
 
 /**
  * Dedicated Whisper worker owned by `TranscriptionPool`. It loads the model
@@ -11,7 +12,7 @@ import { BrowserTranscriber } from './transcribe';
  */
 
 type PoolRequest =
-  | { type: 'init'; forceWasm: boolean }
+  | { type: 'init'; forceWasm: boolean; assetBaseUrl?: string }
   | {
       type: 'transcribe';
       id: number;
@@ -37,8 +38,9 @@ function post(message: PoolResponse): void {
   scope.postMessage(message);
 }
 
-async function initialize(forceWasm: boolean): Promise<void> {
+async function initialize(forceWasm: boolean, assetBaseUrl?: string): Promise<void> {
   try {
+    setBrowserAssetBase(assetBaseUrl);
     const instance = new BrowserTranscriber();
     await instance.load(
       {
@@ -92,7 +94,7 @@ async function transcribe(message: Extract<PoolRequest, { type: 'transcribe' }>)
 scope.onmessage = (event: MessageEvent<PoolRequest>) => {
   const message = event.data;
   if (message.type === 'init') {
-    void initialize(message.forceWasm);
+    void initialize(message.forceWasm, message.assetBaseUrl);
   } else if (message.type === 'transcribe') {
     void transcribe(message);
   }
